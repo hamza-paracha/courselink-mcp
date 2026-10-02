@@ -1,5 +1,7 @@
 # Setup and reference
 
+For agent-assisted setup, ask your coding agent to follow [AGENTS.md](../AGENTS.md). It handles installation, course discovery, and MCP configuration; you sign in and select your courses.
+
 Monitor University of Guelph CourseLink, keep versioned downloads, and search course materials through an MCP client. Run it on your own Mac or Linux machine and sign in with your own account in a dedicated browser window.
 
 The monitor indexes accessible content, assignment instructions, announcements, calendar events, and quiz metadata. It preserves file revisions, records changes, and extracts text from PDFs, Office documents, text files, and ZIP members. It does not submit assignments or start quizzes.
