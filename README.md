@@ -9,3 +9,5 @@ Sign in through a separate browser window. It saves your session privately and c
 It pulls assignment details from the courses you choose, automatically downloads available files into organized course folders, and keeps older versions when files change.
 
 Ask your coding agent: “Set this up using [AGENTS.md](AGENTS.md).” Or follow the [setup guide](docs/setup.md).
+
+Created by [@hamza-paracha](https://github.com/hamza-paracha).

@@ -1,6 +1,7 @@
 [project]
 name = "courselink-mcp"
 version = "0.1.0"
+authors = [{ name = "hamza-paracha" }]
 description = "CourseLink monitor, versioned downloads, and MCP server"
 readme = "README.md"
 license = "MIT"
