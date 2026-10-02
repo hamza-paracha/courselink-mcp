@@ -52,3 +52,30 @@ def test_file_api_cannot_read_arbitrary_files(setup, tmp_path):
                             ('1:content:2', 'x', str(outside), 6, 'now'))
     with pytest.raises(ValueError):
         API(service).file_path(1)
+
+
+async def test_course_configuration_applies_on_next_scan_without_restart(setup):
+    import json
+    config, service = setup
+    (config.state / 'config.json').write_text(json.dumps({'courses': {'2': 'second-course'}}))
+    async def courses(): return [{'id': '2'}]
+    async def empty(course):
+        assert course == '2'
+        return []
+    service.catalog.courses = courses
+    for method in ('content', 'assignments', 'announcements', 'calendar', 'quizzes'):
+        setattr(service.catalog, method, empty)
+    report = await service.scan()
+    assert report['complete'] and config.courses == {'2': 'second-course'}
+    assert service.store.courses()[0]['monitored']
+
+
+async def test_invalid_configuration_never_reports_complete_scan(setup):
+    import json
+    config, service = setup
+    (config.state / 'config.json').write_text(json.dumps({'courses': {'2': '../outside'}}))
+    with pytest.raises(ValueError):
+        await service.scan()
+    report = service.store.get_state('last_scan')
+    assert not report['complete'] and report['errors']
+    assert config.courses == {'1': 'example-course'}

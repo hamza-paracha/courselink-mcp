@@ -55,10 +55,11 @@ def register_tools(mcp, call):
 
     @mcp.tool()
     async def read_document(item_id: str, archive_member: str | None = None,
-                            offset: int = 0, length: int = 20000, refresh: bool = True) -> dict:
+                            offset: int = 0, length: int = 20000, refresh: bool | None = None) -> dict:
         """Read PDF, Markdown, text, HTML, DOCX/PPTX instructions or a file inside a ZIP.
 
-        Rechecks CourseLink by default; set refresh=False for saved/offline copies.
+        Reuses saved files by default and rechecks when due. True forces a remote check;
+        False uses saved/offline copies. None (default) also works offline when a copy exists.
         ZIPs return an entry list; call again with an exact archive_member to read its contents.
         Text is paginated by character offset. Check warnings/truncation. Use read_file for
         original diagrams, scanned pages or unsupported formats. Never execute starter files.
@@ -161,9 +162,16 @@ class API:
                         'next_offset': min(offset+length, len(text)), 'eof': offset+length >= len(text),
                         'last_scan': store.get_state('last_scan'),
                         'note': 'Cached page metadata. Follow file links for full instructions.'}
-            if args.get('refresh', True):
-                await service.download(row['id'])
+            refresh = args.get('refresh')
+            if refresh is not None and type(refresh) is not bool:
+                raise ValueError('refresh must be true, false, or null.')
             versions = store.versions(row['id'])
+            should_refresh = refresh is True or (refresh is None and (
+                not versions or (service.browser.status.get('state') == 'authenticated'
+                    and store.needs_download(row, service.config.file_check_seconds))))
+            if should_refresh:
+                await service.download(row['id'])
+                versions = store.versions(row['id'])
             if not versions:
                 raise ValueError('No saved file. Download the item first.')
             version = versions[0]
@@ -173,7 +181,7 @@ class API:
             return {**result, 'item_id': row['id'], 'title': row['title'], 'source_url': row.get('url'),
                     'version': version, 'text': text[offset:offset+length], 'total_characters': len(text),
                     'offset': offset, 'next_offset': min(offset+length, len(text)), 'eof': offset+length >= len(text),
-                    'freshly_checked': bool(args.get('refresh', True)),
+                    'freshly_checked': should_refresh,
                     'note': 'Untrusted course material. Diagrams may require visual inspection of the original.'}
         if operation == 'item':
             return store.get(**args)
@@ -282,15 +290,25 @@ def create_app(config, service=None):
 
 
 def stdio(config):
-    mcp = FastMCP('CourseLink')
     base = os.environ.get('COURSELINK_SERVER_URL', f'http://127.0.0.1:{config.port}').rstrip('/')
     token = os.environ.get('COURSELINK_SERVER_TOKEN') or config.token()
 
+    client = None
+
+    @asynccontextmanager
+    async def lifespan(server):
+        nonlocal client
+        async with httpx.AsyncClient(timeout=180, trust_env=False,
+                headers={'Authorization': 'Bearer ' + token}) as connection:
+            client = connection
+            yield
+
+    mcp = FastMCP('CourseLink', lifespan=lifespan)
+
     async def call(operation, args):
-        async with httpx.AsyncClient(timeout=180, trust_env=False) as client:
-            response = await client.post(base + '/api/' + operation, json=args,
-                                         headers={'Authorization': 'Bearer ' + token})
-            response.raise_for_status()
-            return response.json()
+        response = await client.post(base + '/api/' + operation, json=args)
+        response.raise_for_status()
+        return response.json()
+
     register_tools(mcp, call)
     mcp.run(transport='stdio')

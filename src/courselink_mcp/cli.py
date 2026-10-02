@@ -19,7 +19,13 @@ def main():
     parser = argparse.ArgumentParser(description='CourseLink monitor and MCP server')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('serve', help='Run the monitor, authenticated REST API and HTTP MCP server')
-    sub.add_parser('stdio', help='MCP stdio bridge to the already-running service')
+    bridge = sub.add_parser('stdio', help='MCP stdio bridge to the monitor')
+    bridge.add_argument('--start-service', action='store_true', help='Start the local monitor if needed')
+    sub.add_parser('start', help='Start the local monitor in the background if needed')
+    sub.add_parser('courses', help='List discovered courses and IDs')
+    configure = sub.add_parser('configure', help='Add course mappings without editing JSON')
+    configure.add_argument('--course', action='append', required=True, metavar='ID=FOLDER')
+    sub.add_parser('mcp-config', help='Print a ready-to-use private MCP client entry')
     sub.add_parser('computer-stdio', help='Local MCP bridge with downloads into local course folders')
     sync = sub.add_parser('sync', help='Sync remote files and course metadata onto this computer')
     sync.add_argument('--course', default=None)
@@ -32,6 +38,29 @@ def main():
     sub.add_parser('init', help='Create config and protected server token')
     args = parser.parse_args()
     config = Config.load()
+    if args.command == 'configure':
+        try:
+            mappings = dict(pair.split('=', 1) for pair in args.course)
+            config.update_courses(mappings)
+        except (ValueError, TypeError) as exc:
+            parser.error(str(exc))
+        print('Courses saved. The next scan will apply them; run courselink check to scan now.')
+        return
+    if args.command == 'mcp-config':
+        entry = {'command': os.path.abspath(sys.executable),
+                 'args': ['-m', 'courselink_mcp.cli', 'stdio', '--start-service'],
+                 'env': {'COURSELINK_STATE_DIR': str(config.state.resolve())}}
+        print(json.dumps({'mcpServers': {'courselink': entry}}, indent=2))
+        return
+    if args.command == 'start' or (args.command == 'stdio' and args.start_service):
+        from .runtime import ensure_service
+        try:
+            ensure_service(config)
+        except (ValueError, RuntimeError, TimeoutError, httpx.HTTPError) as exc:
+            sys.exit('Monitor startup failed: ' + str(exc))
+        if args.command == 'start':
+            print('Monitor is running. Use courselink status to check login and scan progress.')
+            return
     if args.command == 'computer-stdio':
         from .computer import computer_stdio
         asyncio.run(computer_stdio(config))
@@ -74,8 +103,8 @@ def main():
     base = os.environ.get('COURSELINK_SERVER_URL', f'http://127.0.0.1:{config.port}').rstrip('/')
     token = os.environ.get('COURSELINK_SERVER_TOKEN') or config.token()
     with httpx.Client(headers={'Authorization': 'Bearer ' + token}, timeout=180, trust_env=False) as client:
-        if args.command in ('status', 'check'):
-            operation = 'status' if args.command == 'status' else 'scan'
+        if args.command in ('status', 'check', 'courses'):
+            operation = {'status': 'status', 'check': 'scan', 'courses': 'courses'}[args.command]
             response = client.post(base + '/api/' + operation, json={})
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))

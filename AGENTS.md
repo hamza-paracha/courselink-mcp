@@ -41,66 +41,45 @@ If an existing service reports `login_required`, use its `open_login` MCP tool o
 ## 3. Start the monitor and discover courses
 
 ```sh
-uv run courselink serve
+uv run courselink start
+uv run courselink status
+uv run courselink courses
 ```
 
-Keep the service running independently of the MCP bridge. Use a persistent terminal or the environment's long-lived process runner; a foreground tool call that is killed when your turn ends will not keep monitoring. Write any service logs in the private state directory. Track the process you started so you can restart it after configuration changes.
+`start` reuses a healthy existing monitor or starts one detached from the terminal. Its log is `service.log` inside the private state directory. It does not enable startup at boot. Use `serve` only when a foreground process or an external service manager is preferred.
 
-Wait until `uv run courselink status` reports `session.state: authenticated` and an initial scan has finished. No selected courses is normal at this point: enrollment discovery still runs.
-
-Get actual course IDs with `list_courses` if MCP is already connected. Otherwise, use the authenticated local API without displaying its token:
-
-```sh
-uv run python - <<'PY'
-import json
-import httpx
-from courselink_mcp.config import Config
-
-config = Config.load()
-with httpx.Client(trust_env=False, timeout=30) as client:
-    response = client.get(
-        f'http://127.0.0.1:{config.port}/api/courses',
-        headers={'Authorization': 'Bearer ' + config.token()},
-    )
-    response.raise_for_status()
-    for course in response.json()['courses']:
-        print(json.dumps({key: course.get(key) for key in ('id', 'name', 'code')}))
-PY
-```
-
-If the list is still empty, request a scan with `uv run courselink check` and check its completion before treating the result as final. Report enrollment/API errors instead of inventing IDs.
+Wait for authentication and the first scan before selecting courses. If the list is still empty, run `uv run courselink check` and wait for the scan to finish. Report enrollment/API errors instead of inventing IDs. No selected courses is normal for a new installation: enrollment discovery still runs.
 
 ## 4. Select and configure courses
 
 If the user already named courses, match them to the discovered enrollments. Otherwise show the discovered names and ask once which courses to monitor; offer all listed courses as a convenient choice. Do not silently enable every past enrollment.
 
-Merge the selected numeric IDs into the private config's `courses` mapping. Choose readable, unique folder names containing only letters, digits, hyphens, or underscores. Preserve all other settings and do not remove existing mappings unless requested. Keep the config owner-readable/writable only (`0600`). Validate it with `Config.load()`.
+Add the selected courses with the built-in command; the ID below is fictional:
 
-Restart the monitor you started, or use the existing service's process manager, so it reloads the config. Do not kill unrelated Python or browser processes. The next scan will download available files automatically; no per-assignment download setup is needed. Files go to `<school>/<course-folder>/CourseLink Downloads/`.
+```sh
+uv run courselink configure --course 123456=example-course
+uv run courselink check
+```
+
+Repeat `--course ID=FOLDER` for additional courses. Use actual discovered IDs and unique folder names containing letters, digits, hyphens, or underscores. The command validates and atomically merges selections into the private config, preserving other settings. The monitor reloads course selections on the next scan, so a restart is unnecessary.
+
+The scan downloads available files automatically into `<school>/<course-folder>/CourseLink Downloads/`. Do not write course selections or generated client configuration into tracked repository files.
 
 ## 5. Connect the user's assistant
 
 Determine which MCP client the user is using from the environment or existing configuration. If it is unclear, ask only which client to configure. Use that client's supported MCP registration mechanism or config format.
 
-Use [mcp-client.json](mcp-client.json) as the template. Resolve `uv` to its absolute executable path and replace the example clone path with this clone's actual absolute path:
+Generate the complete client entry:
 
-```json
-{
-  "mcpServers": {
-    "courselink": {
-      "command": "/absolute/path/to/uv",
-      "args": [
-        "--directory", "/absolute/path/to/courselink-mcp",
-        "run", "--locked", "courselink", "stdio"
-      ]
-    }
-  }
-}
+```sh
+uv run courselink mcp-config
 ```
 
-Merge only the `courselink` entry, preserving other servers and settings. For clients with a different schema, use the same command and arguments in their format. Include `COURSELINK_STATE_DIR` in the server environment if a custom location is used. Keep the real paths in the user's private client configuration, not this repository's example file.
+It contains the actual Python executable, private state location, and `stdio --start-service` arguments. Merge only its `courselink` entry into the user's private MCP configuration, preserving other servers and settings. For clients with a different schema, use the generated command, arguments, and environment in their supported format. Do not resolve the virtual environment's Python symlink to the base interpreter.
 
-The `stdio` command connects to an already-running monitor; it does not start one. Reload the client's MCP connection and verify that CourseLink tools are visible. Do not claim the client is connected just because its config was written. If reconnection requires the user to restart their app, say that clearly.
+The generated entry automatically starts the local monitor if it is offline and reuses it when already running. Startup remains private on localhost. For an explicitly configured remote HTTP service, use plain `stdio` without `--start-service` instead. The generic [mcp-client.json](mcp-client.json) is also available as a template.
+
+Reload the client's MCP connection and verify that CourseLink tools are visible. Do not claim connection success merely because a config was written. If the user must restart their app, say so clearly.
 
 ## 6. Verify and hand off
 
@@ -113,7 +92,7 @@ Request a scan with `check_now` or `uv run courselink check`, then wait for it t
 
 End with a short confirmation, the download location, and an example such as “Find the instructions for my next assignment.” Mention any remaining client restart or sign-in step. Do not promise permanent login: CourseLink can expire or revoke a session, requiring another browser sign-in.
 
-A local terminal service runs only while its host and process stay running. For unattended Linux startup, adapt [deploy/courselink.service](deploy/courselink.service) to the actual clone/state paths and follow [docs/setup.md](docs/setup.md). Only claim boot startup is enabled after verifying it.
+Monitoring runs only while its host and process stay running. The generated MCP entry can restart it when the client reconnects; it does not configure boot startup. For unattended Linux startup, adapt [deploy/courselink.service](deploy/courselink.service) to the actual clone/state paths and follow [docs/setup.md](docs/setup.md). Only claim boot startup is enabled after verifying it.
 
 ## Keep personal data private
 

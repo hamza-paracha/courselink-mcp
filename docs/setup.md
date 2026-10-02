@@ -22,48 +22,41 @@ On Linux, install Chromium's system dependencies if needed with `uv run playwrig
 
 `init` prints the location of your private `config.json`. By default, configuration and browser state live in `~/Library/Application Support/CourseLink MCP`. Set `COURSELINK_STATE_DIR` to choose another location, using the same value for every command and MCP client.
 
-A new installation starts with **no courses selected**. Sign in and discover your courses:
+A new installation starts with **no courses selected**. Sign in, start the background monitor, and discover your courses:
 
 ```sh
 uv run courselink login
-uv run courselink serve
+uv run courselink start
+uv run courselink status
+uv run courselink courses
 ```
 
-Complete sign-in and MFA in the separate Chromium window. Keep `serve` running. In another terminal, use `uv run courselink status` to check authentication and scan progress. Connect your MCP client as shown below and call `list_courses` to get your own course IDs. You can also find an ID in the `/d2l/home/<course-id>` URL when opening a course in CourseLink.
+Complete sign-in and MFA in the separate Chromium window. `start` reuses an existing local monitor or starts one in the background; you can close the terminal afterward. The host must stay online. Wait for the initial scan to finish before reading the course list.
 
-Stop the service, edit the private `config.json`, and add the courses you want monitored. For example, the following uses a **fictional ID**:
+Select courses with their discovered IDs. The following ID is **fictional**:
 
-```json
-{
-  "courses": {
-    "123456": "example-course"
-  }
-}
+```sh
+uv run courselink configure --course 123456=example-course
+uv run courselink check
 ```
 
-Merge this field into the existing configuration; keep its other settings. Folder names may contain letters, digits, hyphens, or underscores. The `school` setting is the download root, initially the `downloads` folder inside your private state directory. Files are saved under `<school>/<course-folder>/CourseLink Downloads/`.
+Repeat `--course ID=FOLDER` to add more courses. Selections are merged into the private config and take effect on the next scan without restarting. Folder names may contain letters, digits, hyphens, or underscores. Downloads are saved under `<school>/<course-folder>/CourseLink Downloads/`; `school` defaults to the private state's `downloads` directory.
 
-Start `uv run courselink serve` again. The next scan indexes your selected courses and downloads their available files. Existing private configuration is preserved when upgrading.
+Use `uv run courselink serve` when you prefer a foreground monitor. Background startup logs are stored in the private state's `service.log`; `start` does not install a boot service.
 
 ## Connect an MCP client
 
-Copy the `courselink` entry from [mcp-client.json](../mcp-client.json) into a client that supports MCP stdio, replacing `/absolute/path/to/courselink-mcp` with your clone's absolute path:
+Generate a ready-to-use client entry with your own paths:
 
-```json
-{
-  "mcpServers": {
-    "courselink": {
-      "command": "uv",
-      "args": [
-        "--directory", "/absolute/path/to/courselink-mcp",
-        "run", "--locked", "courselink", "stdio"
-      ]
-    }
-  }
-}
+```sh
+uv run courselink mcp-config
 ```
 
-The client must be able to find `uv`; use its absolute executable path if necessary. If you set `COURSELINK_STATE_DIR`, add it to the server entry's `env` object. The stdio command bridges to the service; keep `courselink serve` running separately.
+Merge the resulting `courselink` entry into your MCP client's private configuration. It uses the installed Python interpreter directly and automatically starts the local monitor when needed. Preserve other configured servers. Reload the client's MCP connection after adding it.
+
+Alternatively, adapt [mcp-client.json](../mcp-client.json), replacing its example clone path. If you use a custom `COURSELINK_STATE_DIR`, include that same value in the client's environment. The generated entry already includes it.
+
+Plain `courselink stdio` connects to an existing monitor. `courselink stdio --start-service` starts a missing local monitor; it deliberately rejects custom server URL/token overrides. Use plain stdio for those remote configurations.
 
 Try asking your client to check for new assignments, find a lab's instructions, search downloaded documents, or list recently updated files. Course IDs and your configured folder names both work as course filters. Check `courselink_status` before relying on cached results.
 
@@ -83,11 +76,11 @@ Try asking your client to check for new assignments, find a lab's instructions, 
 | `check_now` | Queue a fresh scan |
 | `open_login` | Open the local browser or explain remote session renewal |
 
-`read_document` rechecks the remote file by default. Use `refresh=False` for cached copies while signed out. Labels are inferred from titles and module paths; use `list_items` and full-text search when a lab or assignment is not grouped as expected. Text extraction has time, memory, and size limits. Inspect the original file for scanned pages, diagrams, layout-sensitive tables, unsupported formats, or truncated text. ZIP contents are read without executing or extracting them onto disk.
+`read_document` reuses saved files by default. It downloads missing files and rechecks authenticated copies when metadata changes or the configured file-check interval expires. Set `refresh=True` to force an immediate remote check, or `refresh=False` to require a saved copy. Cached reads also work while signed out. The response reports whether it freshly checked the file. Labels are inferred from titles and module paths; use `list_items` and full-text search when a lab or assignment is not grouped as expected. Text extraction has time, memory, and size limits. Inspect the original file for scanned pages, diagrams, layout-sensitive tables, unsupported formats, or truncated text. ZIP contents are read without executing or extracting them onto disk.
 
 ## Monitoring and authentication
 
-Defaults are a session check every 60 seconds, a metadata scan every 5 minutes after the previous scan finishes, and same-URL file byte rechecks every hour. `download_file` forces a recheck. SHA-256 detects replaced bytes, and earlier versions remain available. The first scan is a discovery baseline, not evidence that the instructor just uploaded those files.
+Defaults are a session check every 60 seconds, a metadata scan every 5 minutes after the previous scan finishes, and same-URL file byte rechecks every hour. `download_file` forces a recheck. Scans download up to three files concurrently and reuse connections. Set `download_concurrency` to 1–4 in the private config to tune this, then restart the monitor. Metadata is indexed before file downloads so it becomes visible sooner. SHA-256 detects replaced bytes, and earlier versions remain available. The first scan is a discovery baseline, not evidence that the instructor just uploaded those files.
 
 A valid session can be kept active, but institution policy, forced sign-out, MFA, and revoked sessions can still require manual login. Use `open_login` while the local service is running, or stop the service and run `courselink login` again. The browser profile has one owner at a time. Cached data remains readable after authentication expires; new scans and downloads require sign-in. The service host must stay online for continuous monitoring.
 

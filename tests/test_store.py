@@ -50,3 +50,17 @@ def test_search_pagination_and_filename_safety(tmp_path):
     assert len(result['items']) == 2
     assert store.items(query="' OR 1=1--")['total'] == 0
     assert '/' not in safe_name('../../../../file.pdf')
+
+
+def test_link_updates_preserve_other_links_until_full_reconciliation(tmp_path):
+    store = Store(tmp_path / 'db')
+    first = dict(content(), kind='linked_file', id='1:linked:first')
+    second = dict(first, id='1:linked:second')
+    store.upsert_link(first)
+    store.upsert_link(second)
+    store.upsert_link(dict(first, title='Updated'))
+    assert store.get(second['id'])['available']
+    assert len(store.changes()['changes']) == 3
+    store.reconcile('1', 'linked_file', [first])
+    assert not store.get(second['id'])['available']
+    store.close()

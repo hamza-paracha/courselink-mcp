@@ -42,6 +42,9 @@ class Store:
                 item_id TEXT PRIMARY KEY, checked_at TEXT NOT NULL, fingerprint TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS documents(
                 version_id INTEGER PRIMARY KEY, result TEXT NOT NULL, text TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS versions_item ON versions(item_id,id DESC);
+            CREATE INDEX IF NOT EXISTS items_course_kind ON items(course_id,kind,available);
+            CREATE INDEX IF NOT EXISTS changes_course ON changes(course_id,id);
         ''')
 
     def close(self):
@@ -68,7 +71,7 @@ class Store:
         self.db.execute('INSERT INTO changes(time,item_id,course_id,event,details) VALUES(?,?,?,?,?)',
                         (now(), item['id'], item['course_id'], event, canonical(details)))
 
-    def reconcile(self, course_id, kind, items):
+    def reconcile(self, course_id, kind, items, *, mark_missing=True):
         # Only call after the entire endpoint, including every page, succeeds.
         seen = set()
         with self.db:
@@ -91,11 +94,12 @@ class Store:
                     before = json.loads(old['data'])
                     fields = sorted(k for k in set(before) | set(item) if before.get(k) != item.get(k))
                     self.event(item, 'updated', {'title': item['title'], 'changed_fields': fields})
-            for old in self.db.execute('SELECT * FROM items WHERE course_id=? AND kind=? AND available=1',
-                                       (course_id, kind)).fetchall():
-                if old['id'] not in seen:
-                    self.db.execute('UPDATE items SET available=0 WHERE id=?', (old['id'],))
-                    self.event(json.loads(old['data']), 'no_longer_visible', {'title': old['title']})
+            if mark_missing:
+                for old in self.db.execute('SELECT * FROM items WHERE course_id=? AND kind=? AND available=1',
+                                           (course_id, kind)).fetchall():
+                    if old['id'] not in seen:
+                        self.db.execute('UPDATE items SET available=0 WHERE id=?', (old['id'],))
+                        self.event(json.loads(old['data']), 'no_longer_visible', {'title': old['title']})
 
     def get(self, item_id):
         row = self.db.execute('SELECT * FROM items WHERE id=?', (item_id,)).fetchone()
@@ -105,10 +109,7 @@ class Store:
                 'first_seen': row['first_seen'], 'last_seen': row['last_seen']}
 
     def upsert_link(self, item):
-        existing = [json.loads(r[0]) for r in self.db.execute(
-            'SELECT data FROM items WHERE course_id=? AND kind=? AND available=1 AND id!=?',
-            (item['course_id'], 'linked_file', item['id']))]
-        self.reconcile(item['course_id'], 'linked_file', existing + [item])
+        self.reconcile(item['course_id'], 'linked_file', [item], mark_missing=False)
 
     def items(self, course_id=None, kind=None, query='', limit=100, offset=0, category=None):
         clauses, params = ['available=1'], []
