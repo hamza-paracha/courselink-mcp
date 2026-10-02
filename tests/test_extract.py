@@ -1,0 +1,66 @@
+import io
+import zipfile
+
+import pytest
+
+from courselink_mcp.extract import extract_bytes
+from courselink_mcp.store import Store
+
+
+def archive(files):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as zip:
+        for name, data in files.items():
+            zip.writestr(name, data)
+    return output.getvalue()
+
+
+def test_zip_instructions_and_code_are_read_without_executing():
+    data = archive({'instructions.md': '# Lab 1\nSubmit Friday.', 'main.c': '#include <stdio.h>', '../outside.txt': 'text'})
+    listing = extract_bytes(data, 'Lab1.zip')
+    assert listing['status'] == 'archive_summary'
+    assert len(listing['entries']) == 3
+    assert 'Submit Friday' in listing['text']
+    assert 'Submit Friday' in extract_bytes(data, 'Lab1.zip', 'instructions.md')['text']
+    # Even an unsafe archive path is read in-memory, never extracted onto disk.
+    assert extract_bytes(data, 'Lab1.zip', '../outside.txt')['text'] == 'text'
+
+
+def test_nested_zip_and_binary_files_report_limits():
+    data = archive({'nested.zip': b'not a zip'})
+    with pytest.raises(ValueError, match='Nested'):
+        extract_bytes(data, 'outer.zip', 'nested.zip')
+    assert extract_bytes(b'abc', 'video.mp4')['status'] == 'unsupported_format'
+
+
+def test_docx_and_html_text():
+    data = archive({'word/document.xml': '<w:document xmlns:w="test"><w:p><w:t>Assignment 1</w:t></w:p></w:document>'})
+    assert extract_bytes(data, 'instructions.docx')['text'] == 'Assignment 1'
+    result = extract_bytes(b'<h1>Lab 2</h1><script>bad()</script><p>Due Friday</p>', 'lab.html')
+    assert 'Lab 2' in result['text'] and 'Due Friday' in result['text'] and 'bad' not in result['text']
+
+
+def test_assembly_and_spreadsheet_cells():
+    assert 'MOVE' in extract_bytes(b'MOVE D0,D1', 'lab.X68')['text']
+    data = archive({'xl/sharedStrings.xml': '<sst xmlns="sheet"><si><t>Assignment</t></si></sst>',
+                    'xl/worksheets/sheet1.xml': '<worksheet xmlns="sheet"><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1"><f>2+2</f><v>4</v></c></row></sheetData></worksheet>'})
+    result = extract_bytes(data, 'rubric.xlsx')
+    assert 'A1: Assignment' in result['text']
+    assert 'B1: =2+2 => 4' in result['text']
+    assert result['warnings']
+
+
+def test_search_only_returns_latest_available_versions(tmp_path):
+    store = Store(tmp_path / 'db')
+    item = {'id':'1:content:2','course_id':'1','kind':'content','title':'Lab 1','category':'lab'}
+    store.reconcile('1','content',[item])
+    for index, word in enumerate(['old instructions','new instructions']):
+        file = tmp_path / f'temp{index}'
+        file.write_text(word)
+        version, _ = store.record_file(item,file,tmp_path/f'saved{index}',str(index),len(word))
+        store.save_document(version['id'], {'status':'ok','text':word})
+    assert not store.search_documents('old')['matches']
+    assert len(store.search_documents('new')['matches']) == 1
+    assert store.items(category='lab')['total'] == 1
+    store.reconcile('1','content',[])
+    assert not store.search_documents('new')['matches']

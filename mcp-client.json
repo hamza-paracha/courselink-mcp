@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "courselink": {
+      "command": "uv",
+      "args": [
+        "--directory", "/absolute/path/to/courselink-mcp",
+        "run", "--locked", "courselink", "stdio"
+      ]
+    }
+  }
+}
