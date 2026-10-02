@@ -174,3 +174,5 @@ uv run pytest -q
 Tests use synthetic courses and mocked requests; no live account is needed. They cover change tracking, pagination, revision retention, download limits, path safety, login response rejection, request authentication, document extraction, and partial scan failures.
 
 Released under the [MIT License](../LICENSE).
+
+Computer sync scans for updates, then copies saved versions without downloading every file from CourseLink again. Same-URL byte changes are checked on the configured file-check interval. Use `download_to_computer(refresh=True)` to force an immediate recheck of one file, or `sync_to_computer(refresh=False)` to copy cached files without requesting a scan.

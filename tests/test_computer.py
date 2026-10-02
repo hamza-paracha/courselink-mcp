@@ -138,3 +138,45 @@ async def test_remote_bridge_quotes_paths_and_uses_configured_host(monkeypatch):
     assert shlex.split(captured[0].args[-1]) == [
         'env', 'COURSELINK_STATE_DIR=/srv/private state',
         '/srv/my clone/.venv/bin/courselink', 'stdio']
+
+
+@pytest.mark.parametrize('scan_complete', [True, False])
+async def test_fresh_sync_reuses_scan_downloads_and_reports_partial_coverage(setup, monkeypatch, scan_complete):
+    computer, item, version = setup
+    original_call = computer.call
+    item['download_path'] = '/content/lab.pdf'
+    calls = []
+    scanned = False
+
+    async def call(operation, args):
+        nonlocal scanned
+        calls.append(operation)
+        if operation == 'status':
+            return {'session': {'state': 'authenticated'}, 'scanning': False,
+                    'last_scan': {'complete': scan_complete if scanned else True,
+                                  'finished_at': 'new' if scanned else 'old'}}
+        if operation == 'scan':
+            scanned = True
+            return {'queued': True}
+        if operation == 'items':
+            return {'items': [item], 'total': 1}
+        if operation == 'versions':
+            return {'versions': [version]}
+        return await original_call(operation, args)
+
+    async def no_wait(seconds):
+        pass
+
+    monkeypatch.setattr('courselink_mcp.computer.asyncio.sleep', no_wait)
+    computer.call = call
+    result = await computer.sync()
+    assert result['complete'] is scan_complete
+    assert result['saved'] == 1
+    assert calls.count('scan') == 1
+    assert 'download' not in calls
+    assert len(result['errors']) == (0 if scan_complete else 1)
+    # A subsequent sync also avoids transferring unchanged bytes to this computer.
+    calls.clear()
+    result = await computer.sync(refresh=False)
+    assert result['unchanged'] == 1
+    assert 'read_file' not in calls and 'download' not in calls
