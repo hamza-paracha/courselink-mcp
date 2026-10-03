@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -29,7 +30,9 @@ class BrowserSession:
         self.versions = {}
         self.status = {'state': 'starting', 'last_verified': None}
         self.lock = asyncio.Lock()
-        self.api_lock = asyncio.Lock()
+        self.api_slots = asyncio.Semaphore(config.api_concurrency)
+        self.rate_limited_until = 0
+        self.metrics = {'requests': 0, 'rate_limits': 0, 'request_seconds': 0.0}
         self.closed = True
 
     async def start(self):
@@ -89,18 +92,24 @@ class BrowserSession:
         url = self.url(path)
         if self.closed or not self.context:
             raise LoginRequired('Browser is reconnecting.')
-        async with self.api_lock:
+        async with self.api_slots:
             for attempt in range(3):
+                while self.rate_limited_until > time.monotonic():
+                    await asyncio.sleep(self.rate_limited_until - time.monotonic())
+                self.metrics['requests'] += 1
+                started = time.monotonic()
                 response = await self.context.request.get(url, params=params,
                     timeout=30000, max_redirects=0, headers={'Accept': 'application/json'})
                 try:
                     status = response.status
                     if status == 429:
+                        self.metrics['rate_limits'] += 1
                         delay = response.headers.get('retry-after', '5')
                         try:
                             delay = min(max(float(delay), 1), 60)
                         except ValueError:
                             delay = 10
+                        self.rate_limited_until = max(self.rate_limited_until, time.monotonic() + delay)
                         if attempt == 2:
                             raise RateLimited('CourseLink requested slower polling. Will retry later.')
                     elif status in (301, 302, 303, 307, 308, 401):
@@ -114,8 +123,8 @@ class BrowserSession:
                     else:
                         return await response.json()
                 finally:
+                    self.metrics['request_seconds'] += time.monotonic() - started
                     await response.dispose()
-                await asyncio.sleep(delay)
         raise RateLimited('CourseLink rate limit reached.')
 
     async def discover_versions(self):

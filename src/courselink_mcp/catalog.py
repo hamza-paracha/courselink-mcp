@@ -1,3 +1,4 @@
+import asyncio
 from html.parser import HTMLParser
 from urllib.parse import urlsplit, urljoin, unquote
 import hashlib
@@ -94,40 +95,58 @@ class Catalog:
         toc = await self.browser.get(self.browser.api('le', f'{course}/content/toc'))
         if not isinstance(toc.get('Modules'), list):
             raise ValueError('Unrecognized content table of contents.')
-        results = []
-        async def walk(modules, parent=''):
+        work = []
+        def walk(modules, parent=''):
             for module in modules:
                 if module.get('IsHidden') or module.get('IsLocked'):
                     continue
                 path = f'{parent}/{module["Title"]}'.strip('/')
                 if 'ModuleId' in module:
-                    mid = module['ModuleId']
+                    work.append(('module', module, path))
+                for topic in module.get('Topics', []):
+                    if not topic.get('IsHidden') and not topic.get('IsLocked'):
+                        work.append(('topic', topic, path))
+                walk(module.get('Modules', []), path)
+        walk(toc['Modules'])
+        results = [None] * len(work)
+        pending = iter(enumerate(work))
+
+        async def worker():
+            for index, (kind, node, path) in pending:
+                if kind == 'module':
+                    mid = node['ModuleId']
                     details = await self.browser.get(self.browser.api('le', f'{course}/content/modules/{mid}'))
-                    results.append(item(course, 'content', f'module:{mid}', module['Title'],
-                        category=category(module['Title'], path), module=path, content_type='module',
+                    result = item(course, 'content', f'module:{mid}', node['Title'],
+                        category=category(node['Title'], path), module=path, content_type='module',
                         description=richtext(details.get('Description')), instructions=details.get('Description'),
                         start_date=details.get('StartDate'), end_date=details.get('EndDate'),
-                        due_date=details.get('DueDate'), modified_at=module.get('LastModifiedDate'),
-                        url=self.browser.url(f'/d2l/le/content/{course}/Home'), download_path=None))
-                for topic in module.get('Topics', []):
-                    if topic.get('IsHidden') or topic.get('IsLocked'):
-                        continue
-                    identifier = topic['TopicId']
+                        due_date=details.get('DueDate'), modified_at=node.get('LastModifiedDate'),
+                        url=self.browser.url(f'/d2l/le/content/{course}/Home'), download_path=None)
+                else:
+                    identifier = node['TopicId']
                     details = await self.browser.get(self.browser.api('le', f'{course}/content/topics/{identifier}'))
-                    source = topic.get('Url', '')
-                    # Only file-backed course topics; links to other activities stay as metadata.
+                    source = node.get('Url', '')
                     file_backed = urlsplit(source).path.startswith(('/content/', '/shared/'))
-                    results.append(item(course, 'content', identifier, topic['Title'],
-                        category=category(topic['Title'], path), module=path,
+                    result = item(course, 'content', identifier, node['Title'],
+                        category=category(node['Title'], path), module=path,
                         url=self.browser.url(f'/d2l/le/content/{course}/viewContent/{identifier}/View'),
-                        source_url=source, modified_at=topic.get('LastModifiedDate'),
+                        source_url=source, modified_at=node.get('LastModifiedDate'),
                         description=richtext(details.get('Description')), instructions=details.get('Description'),
                         due_date=details.get('DueDate'), content_type='topic',
-                        start_date=topic.get('StartDateTime'), end_date=topic.get('EndDateTime'),
+                        start_date=node.get('StartDateTime'), end_date=node.get('EndDateTime'),
                         download_path=self.browser.api('le', f'{course}/content/topics/{identifier}/file') if file_backed else None,
-                        filename=urlsplit(source).path.rsplit('/', 1)[-1] if file_backed else None))
-                await walk(module.get('Modules', []), path)
-        await walk(toc['Modules'])
+                        filename=urlsplit(source).path.rsplit('/', 1)[-1] if file_backed else None)
+                results[index] = result
+
+        limit = getattr(getattr(self.browser, 'config', None), 'api_concurrency', 2)
+        tasks = [asyncio.create_task(worker()) for _ in range(min(limit, len(work)))]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         return results
 
     async def assignments(self, course):

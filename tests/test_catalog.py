@@ -118,3 +118,51 @@ async def test_calendar_and_quiz_keep_links_for_file_discovery(method, raw):
     description = {'Html': '<a href="/content/enforced/1/instructions.pdf">Read this</a>'}
     rows = await getattr(Catalog(FakeBrowser([{**raw, 'Description': description}])), method)('1')
     assert rows[0]['instructions'] == description
+
+
+async def test_content_details_are_bounded_and_keep_tree_order():
+    import asyncio
+    from types import SimpleNamespace
+    toc = {'Modules': [{'ModuleId': 1, 'Title': 'Files', 'Topics': [
+        {'TopicId': i, 'Title': str(i), 'Url': '/content/file.pdf'} for i in range(2, 10)]}]}
+    browser = FakeBrowser(toc)
+    browser.config = SimpleNamespace(api_concurrency=2)
+    active = peak = 0
+    async def get(path):
+        nonlocal active, peak
+        if path.endswith('/toc'):
+            return toc
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.02 if path.endswith('/1') else 0.001)
+            return {'Description': {'Text': path}}
+        finally:
+            active -= 1
+    browser.get = get
+    rows = await Catalog(browser).content('1')
+    assert peak == 2 and active == 0
+    assert [row['id'] for row in rows] == ['1:content:module:1'] + [f'1:content:{i}' for i in range(2, 10)]
+
+
+async def test_failed_content_detail_cancels_other_workers():
+    import asyncio
+    toc = {'Modules': [{'Title': 'Files', 'Topics': [
+        {'TopicId': i, 'Title': str(i)} for i in range(2)]}]}
+    browser = FakeBrowser(toc)
+    second_started = asyncio.Event()
+    second_cancelled = asyncio.Event()
+    async def get(path):
+        if path.endswith('/toc'): return toc
+        if path.endswith('/0'):
+            await second_started.wait()
+            raise EndpointUnavailable('missing detail')
+        second_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            second_cancelled.set()
+    browser.get = get
+    with pytest.raises(EndpointUnavailable):
+        await asyncio.wait_for(Catalog(browser).content('1'), 2)
+    assert second_cancelled.is_set()

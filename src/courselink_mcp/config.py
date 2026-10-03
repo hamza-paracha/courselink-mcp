@@ -31,6 +31,7 @@ class Config:
     max_file_bytes: int = 100 * 1024 * 1024
     headless: bool = False
     download_concurrency: int = 3
+    api_concurrency: int = 2
     courses: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -66,7 +67,7 @@ class Config:
 
     def validate(self):
         for name in ('port', 'poll_seconds', 'keepalive_seconds', 'file_check_seconds',
-                     'max_file_bytes', 'download_concurrency'):
+                     'max_file_bytes', 'download_concurrency', 'api_concurrency'):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= 2**63 - 1:
                 raise ValueError(f'{name} must be a positive integer within the supported range.')
@@ -82,6 +83,8 @@ class Config:
             raise ValueError('Invalid port')
         if type(self.download_concurrency) is not int or not 1 <= self.download_concurrency <= 4:
             raise ValueError('Download concurrency must be between 1 and 4.')
+        if not 1 <= self.api_concurrency <= 4:
+            raise ValueError('API concurrency must be between 1 and 4.')
         if not isinstance(self.courses, dict):
             raise ValueError('Courses must map numeric IDs to folder names.')
         for course, folder in self.courses.items():

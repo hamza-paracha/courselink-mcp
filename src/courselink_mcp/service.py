@@ -11,7 +11,7 @@ import tempfile
 import json
 import sys
 import time
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
@@ -117,6 +117,7 @@ class Service:
                 'last_scan': self.store.get_state('last_scan'), 'last_error': self.store.get_state('last_error'),
                 'poll_seconds': self.config.poll_seconds, 'file_check_seconds': self.config.file_check_seconds,
                 'downloads': {'active': self.active_downloads, 'concurrency': self.config.download_concurrency},
+                'api_metrics': {**self.browser.metrics, 'concurrency': self.config.api_concurrency},
                 'monitored_courses': self.config.courses, 'api_versions': self.browser.versions,
                 'text_index': self.store.index_status(),
                 'coverage_scope': 'Accessible content, assignments, announcements, calendar and quiz metadata '
@@ -180,6 +181,7 @@ class Service:
     async def scan(self, verify_files=False):
         async with self.scan_lock:
             started = time.monotonic()
+            initial_metrics = dict(self.browser.metrics)
             report = {'started_at': now(), 'finished_at': None, 'courses': {}, 'errors': [], 'files_saved': 0}
             report['verify_files'] = verify_files
             try:
@@ -209,7 +211,7 @@ class Service:
                             self.store.reconcile(course, kind, rows)
                             report['courses'][course][kind] = len(rows)
                             pending.extend(rows)
-                            await asyncio.sleep(0.2)
+                            await asyncio.sleep(0)
                         except (LoginRequired, RateLimited):
                             raise
                         except Exception as exc:
@@ -236,6 +238,8 @@ class Service:
                 raise
             finally:
                 report['duration_seconds'] = round(time.monotonic() - started, 3)
+                report['api_activity_during_scan'] = {
+                    key: round(value - initial_metrics[key], 3) for key, value in self.browser.metrics.items()}
                 report['finished_at'] = now()
                 report['complete'] = not report['errors'] and len(report['courses']) == len(self.config.courses)
                 report['complete'] = report['complete'] and all(len(v) == 6 for v in report['courses'].values())
@@ -349,6 +353,15 @@ class Service:
             raise ValueError('Unsafe download directory.')
         filename = safe_name(unquote(row.get('filename') or row['title']))
         url = self.browser.url(row['download_path'])
+        fallback = None
+        if row['kind'] == 'content' and row.get('source_url'):
+            try:
+                candidate = self.browser.url(row['source_url'])
+                decoded = unquote(urlsplit(candidate).path)
+                if decoded.startswith(('/content/', '/shared/')) and '\\' not in decoded and '..' not in decoded.split('/'):
+                    fallback = candidate
+            except ValueError:
+                pass
         temp = None
         try:
             if self.download_client is None:
@@ -360,6 +373,9 @@ class Service:
                 cookies = await self.browser.cookies()
                 cookie_header = httpx.Request('GET', url, cookies=cookies).headers.get('cookie', '')
                 async with client.stream('GET', url, headers={'Cache-Control': 'no-cache', 'Cookie': cookie_header}) as response:
+                    if response.status_code == 404 and fallback and urlsplit(url).path.startswith('/d2l/api/'):
+                        url, fallback = fallback, None
+                        continue
                     if response.status_code in (301, 302, 303, 307, 308):
                         redirect = urljoin(url, response.headers.get('location', ''))
                         try:

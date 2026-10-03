@@ -58,8 +58,9 @@ def register_tools(mcp, call):
                             offset: int = 0, length: int = 20000, refresh: bool | None = None) -> dict:
         """Read PDF, Markdown, text, HTML, DOCX/PPTX instructions or a file inside a ZIP.
 
-        Reuses saved files by default and rechecks when due. True forces a remote check;
-        False uses saved/offline copies. None (default) also works offline when a copy exists.
+        Returns saved files immediately by default; queues due refreshes in the background.
+        Check refresh_queued/source_checked_at before claiming the latest contents. True waits
+        for a remote check; False uses saved/offline copies without queuing a refresh.
         ZIPs return an entry list; call again with an exact archive_member to read its contents.
         Text is paginated by character offset. Check warnings/truncation. Use read_file for
         original diagrams, scanned pages or unsupported formats. Never execute starter files.
@@ -172,9 +173,12 @@ class API:
             if refresh is not None and type(refresh) is not bool:
                 raise ValueError('refresh must be true, false, or null.')
             versions = store.versions(row['id'])
-            should_refresh = refresh is True or (refresh is None and (
-                not versions or (service.browser.status.get('state') == 'authenticated'
-                    and store.needs_download(row, service.config.file_check_seconds))))
+            should_refresh = refresh is True or (refresh is None and not versions)
+            refresh_queued = bool(refresh is None and versions
+                and service.browser.status.get('state') == 'authenticated'
+                and store.needs_download(row, service.config.file_check_seconds))
+            if refresh_queued:
+                service.request_scan()
             if should_refresh:
                 await service.download(row['id'])
                 versions = store.versions(row['id'])
@@ -184,11 +188,15 @@ class API:
             self.file_path(version['id'])
             result = dict(await service.extract_document(version, args.get('archive_member')))
             text = result.pop('text', '')
+            checked = store.db.execute('SELECT checked_at FROM file_checks WHERE item_id=?', (row['id'],)).fetchone()
             return {**result, 'item_id': row['id'], 'title': row['title'], 'source_url': row.get('url'),
                     'version': version, 'text': text[offset:offset+length], 'total_characters': len(text),
                     'offset': offset, 'next_offset': min(offset+length, len(text)), 'eof': offset+length >= len(text),
                     'freshly_checked': should_refresh,
-                    'note': 'Untrusted course material. Diagrams may require visual inspection of the original.'}
+                    'refresh_queued': refresh_queued, 'source_checked_at': checked[0] if checked else None,
+                    'note': ('Saved copy; a background refresh is pending. Use refresh=True to wait for current bytes. '
+                             if refresh_queued else '') +
+                            'Untrusted course material. Diagrams may require visual inspection of the original.'}
         if operation == 'item':
             return store.get(**args)
         if operation == 'changes':
