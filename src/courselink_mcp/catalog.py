@@ -119,8 +119,10 @@ class Catalog:
                     result = item(course, 'content', f'module:{mid}', node['Title'],
                         category=category(node['Title'], path), module=path, content_type='module',
                         description=richtext(details.get('Description')), instructions=details.get('Description'),
-                        start_date=details.get('StartDate'), end_date=details.get('EndDate'),
-                        due_date=details.get('DueDate'), modified_at=node.get('LastModifiedDate'),
+                        start_date=details.get('ModuleStartDate', details.get('StartDate')),
+                        end_date=details.get('ModuleEndDate', details.get('EndDate')),
+                        due_date=details.get('ModuleDueDate', details.get('DueDate')),
+                        modified_at=details.get('LastModifiedDate', node.get('LastModifiedDate')),
                         url=self.browser.url(f'/d2l/le/content/{course}/Home'), download_path=None)
                 else:
                     identifier = node['TopicId']

@@ -116,3 +116,33 @@ async def test_scan_request_preserves_thorough_check_when_requests_coalesce(setu
     assert service.verify_files_requested and service.wake.is_set()
     with pytest.raises(ValueError):
         await api.call('scan', {'verify_files': 'false'})
+
+
+async def test_parent_failure_preserves_links_and_reports_stale_cache(setup):
+    from datetime import datetime, timezone, timedelta
+    _, service = setup
+    old = {'id': '1:linked_file:previous', 'course_id': '1', 'kind': 'linked_file', 'title': 'Keep link'}
+    service.store.upsert_link(old)
+    checked = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+    service.store.set_state('last_successful_scan', {'complete': True, 'finished_at': checked})
+    async def courses(): return [{'id': '1'}]
+    async def empty(course): return []
+    async def fail(course): raise RuntimeError('Synthetic section outage')
+    service.catalog.courses = courses
+    for name in ('content', 'assignments', 'announcements', 'calendar', 'quizzes'):
+        setattr(service.catalog, name, empty)
+    service.catalog.assignments = fail
+    report = await service.scan()
+    assert not report['complete'] and service.store.get(old['id'])['available']
+    assert any(e['section'] == 'linked_file' for e in report['errors'])
+    result = await API(service).call('changes', {'after': 0})
+    assert result['freshness']['checked_at'] == checked
+    assert result['freshness']['refresh_due'] and not result['freshness']['latest_scan_complete']
+    assert set(report['phases']) == {'enrollment', 'content', 'assignment', 'announcement', 'event', 'quiz', 'downloads', 'linked_files'}
+    assert all(p['seconds'] >= 0 and p['calls'] == 1 for p in report['phases'].values())
+    service.catalog.assignments = empty
+    report = await service.scan()
+    assert report['complete'] and not service.store.get(old['id'])['available']
+    fresh = (await API(service).call('changes', {}))['freshness']
+    assert fresh['latest_scan_complete'] and not fresh['refresh_due']
+    assert fresh['checked_at'] == report['finished_at']

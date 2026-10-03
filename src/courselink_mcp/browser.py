@@ -1,7 +1,11 @@
 import asyncio
 import json
+import math
 import re
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -21,6 +25,23 @@ class RateLimited(RuntimeError):
     pass
 
 
+def retry_after_seconds(value):
+    """Honor both Retry-After forms, without shortening a server's delay."""
+    try:
+        delay = float(value)
+        if not math.isfinite(delay):
+            raise ValueError('Non-finite delay')
+    except (ValueError, TypeError):
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                raise ValueError('Retry-After date needs a timezone')
+            delay = date.timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            delay = 10
+    return max(delay, 1)
+
+
 class BrowserSession:
     def __init__(self, config):
         self.config = config
@@ -32,8 +53,41 @@ class BrowserSession:
         self.lock = asyncio.Lock()
         self.api_slots = asyncio.Semaphore(config.api_concurrency)
         self.rate_limited_until = 0
-        self.metrics = {'requests': 0, 'rate_limits': 0, 'request_seconds': 0.0}
+        self.metrics = dict.fromkeys(('requests', 'rate_limits', 'request_seconds',
+            'queue_seconds', 'cooldown_seconds', 'successes', 'errors', 'cancellations'), 0)
+        self.metric_scope = ContextVar('courselink_api_metrics', default=None)
         self.closed = True
+
+    def count(self, key, value=1):
+        self.metrics[key] += value
+        scope = self.metric_scope.get()
+        if scope is not None:
+            scope[key] += value
+
+    @contextmanager
+    def measure(self):
+        metrics = dict.fromkeys(self.metrics, 0)
+        token = self.metric_scope.set(metrics)
+        try:
+            yield metrics
+        finally:
+            self.metric_scope.reset(token)
+
+    def rate_limit(self, retry_after):
+        self.count('rate_limits')
+        delay = retry_after_seconds(retry_after)
+        self.rate_limited_until = max(self.rate_limited_until, time.monotonic() + delay)
+
+    async def wait_for_cooldown(self, deadline=None):
+        deadline = time.monotonic() + 60 if deadline is None else deadline
+        started = time.monotonic()
+        try:
+            while self.rate_limited_until > time.monotonic():
+                if self.rate_limited_until > deadline:
+                    raise RateLimited('CourseLink requested a longer cooldown. Work deferred until a later scan.')
+                await asyncio.sleep(self.rate_limited_until - time.monotonic())
+        finally:
+            self.count('cooldown_seconds', time.monotonic() - started)
 
     async def start(self):
         from playwright.async_api import async_playwright
@@ -92,24 +146,32 @@ class BrowserSession:
         url = self.url(path)
         if self.closed or not self.context:
             raise LoginRequired('Browser is reconnecting.')
-        async with self.api_slots:
-            for attempt in range(3):
-                while self.rate_limited_until > time.monotonic():
-                    await asyncio.sleep(self.rate_limited_until - time.monotonic())
-                self.metrics['requests'] += 1
-                started = time.monotonic()
-                response = await self.context.request.get(url, params=params,
-                    timeout=30000, max_redirects=0, headers={'Accept': 'application/json'})
+        context = self.context
+        deadline = time.monotonic() + 60
+        for attempt in range(3):
+            # Cooldown waits do not occupy request slots; recheck after admission.
+            while True:
+                await self.wait_for_cooldown(deadline)
+                queued = time.monotonic()
                 try:
+                    await self.api_slots.acquire()
+                finally:
+                    self.count('queue_seconds', time.monotonic() - queued)
+                if self.rate_limited_until <= time.monotonic():
+                    break
+                self.api_slots.release()
+            try:
+                if self.closed or self.context is not context:
+                    raise LoginRequired('Browser reconnected during the request; retry with its new session.')
+                self.count('requests')
+                started = time.monotonic()
+                response = None
+                try:
+                    response = await context.request.get(url, params=params,
+                        timeout=30000, max_redirects=0, headers={'Accept': 'application/json'})
                     status = response.status
                     if status == 429:
-                        self.metrics['rate_limits'] += 1
-                        delay = response.headers.get('retry-after', '5')
-                        try:
-                            delay = min(max(float(delay), 1), 60)
-                        except ValueError:
-                            delay = 10
-                        self.rate_limited_until = max(self.rate_limited_until, time.monotonic() + delay)
+                        self.rate_limit(response.headers.get('retry-after', '5'))
                         if attempt == 2:
                             raise RateLimited('CourseLink requested slower polling. Will retry later.')
                     elif status in (301, 302, 303, 307, 308, 401):
@@ -121,10 +183,21 @@ class BrowserSession:
                     elif 'json' not in response.headers.get('content-type', '').lower():
                         raise LoginRequired('CourseLink returned a sign-in page instead of data.')
                     else:
-                        return await response.json()
+                        data = await response.json()
+                        self.count('successes')
+                        return data
+                except asyncio.CancelledError:
+                    self.count('cancellations')
+                    raise
+                except Exception:
+                    self.count('errors')
+                    raise
                 finally:
-                    self.metrics['request_seconds'] += time.monotonic() - started
-                    await response.dispose()
+                    self.count('request_seconds', time.monotonic() - started)
+                    if response is not None:
+                        await response.dispose()
+            finally:
+                self.api_slots.release()
         raise RateLimited('CourseLink rate limit reached.')
 
     async def discover_versions(self):

@@ -1,7 +1,7 @@
 import asyncio
 from collections import deque
 from weakref import WeakValueDictionary
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from dataclasses import replace
 import hashlib
@@ -40,6 +40,30 @@ class Service:
         self.extract_lock = asyncio.Lock()
         self.heartbeats = {}
         self.verify_files_requested = False
+
+    @contextmanager
+    def phase(self, report, name):
+        started = time.monotonic()
+        with self.browser.measure() as metrics:
+            try:
+                yield
+            finally:
+                phase = report['phases'].setdefault(name, {'seconds': 0, 'calls': 0, 'api': {}})
+                phase['seconds'] = round(phase['seconds'] + time.monotonic() - started, 6)
+                phase['calls'] += 1
+                for key, value in metrics.items():
+                    phase['api'][key] = round(phase['api'].get(key, 0) + value, 6)
+
+    def freshness(self):
+        latest = self.store.get_state('last_scan') or {}
+        successful = self.store.get_state('last_successful_scan') or (latest if latest.get('complete') else {})
+        checked = successful.get('finished_at')
+        age = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(checked)).total_seconds()) if checked else None
+        return {'checked_at': checked, 'age_seconds': round(age, 1) if age is not None else None,
+                'latest_scan_complete': bool(latest.get('complete')),
+                'refresh_interval_seconds': self.config.poll_seconds,
+                'refresh_due': age is None or age >= self.config.poll_seconds or not latest.get('complete'),
+                'scanning': self.scan_lock.locked(), 'session_state': self.browser.status['state']}
 
     async def start(self):
         self.heartbeats = {name: time.monotonic() for name in ('session', 'scan', 'index')}
@@ -135,6 +159,10 @@ class Service:
                 'session': self.browser.status, 'already_scanning': self.scan_lock.locked()}
 
     async def extract_document(self, version, member=None):
+        # A cached read must not queue behind an unrelated slow parser.
+        cached = self.store.document(version['id']) if member is None else None
+        if cached is not None and cached.get('extractor_version') == EXTRACTOR_VERSION:
+            return cached
         async with self.extract_lock:
             cached = self.store.document(version['id']) if member is None else None
             if cached is not None and cached.get('extractor_version') == EXTRACTOR_VERSION:
@@ -182,7 +210,8 @@ class Service:
         async with self.scan_lock:
             started = time.monotonic()
             initial_metrics = dict(self.browser.metrics)
-            report = {'started_at': now(), 'finished_at': None, 'courses': {}, 'errors': [], 'files_saved': 0}
+            report = {'started_at': now(), 'finished_at': None, 'courses': {}, 'errors': [], 'files_saved': 0,
+                      'phases': {}}
             report['verify_files'] = verify_files
             try:
                 settings_path = self.config.state / 'config.json'
@@ -190,7 +219,8 @@ class Service:
                     settings = json.loads(settings_path.read_text())
                     selected = replace(self.config, courses=settings.get('courses', self.config.courses)).validate()
                     self.config.courses = selected.courses
-                courses = await self.catalog.courses()
+                with self.phase(report, 'enrollment'):
+                    courses = await self.catalog.courses()
                 for course in courses:
                     course['monitored'] = course['id'] in self.config.courses
                     course['folder'] = self.config.courses.get(course['id'])
@@ -203,22 +233,30 @@ class Service:
                         continue
                     report['courses'][course] = {}
                     pending = []
+                    parents_complete = True
                     for kind, fetch in [('content', self.catalog.content), ('assignment', self.catalog.assignments),
                                         ('announcement', self.catalog.announcements), ('event', self.catalog.calendar),
                                         ('quiz', self.catalog.quizzes)]:
                         try:
-                            rows = await fetch(course)
-                            self.store.reconcile(course, kind, rows)
+                            with self.phase(report, kind):
+                                rows = await fetch(course)
+                                self.store.reconcile(course, kind, rows)
                             report['courses'][course][kind] = len(rows)
                             pending.extend(rows)
                             await asyncio.sleep(0)
                         except (LoginRequired, RateLimited):
                             raise
                         except Exception as exc:
+                            parents_complete = False
                             report['errors'].append({'course': course, 'section': kind, 'message': str(exc)[:250]})
-                    await self.download_rows(course, pending, report, verify_files=verify_files)
+                    errors_before_downloads = len(report['errors'])
+                    with self.phase(report, 'downloads'):
+                        await self.download_rows(course, pending, report, verify_files=verify_files)
+                    parents_complete = parents_complete and len(report['errors']) == errors_before_downloads
                     try:
-                        linked_count, saved, errors = await self.scan_linked_files(course, verify_files=verify_files)
+                        with self.phase(report, 'linked_files'):
+                            linked_count, saved, errors = await self.scan_linked_files(course,
+                                verify_files=verify_files, parents_complete=parents_complete)
                         report['courses'][course]['linked_file'] = linked_count
                         report['files_saved'] += saved
                         report['errors'].extend(errors)
@@ -244,15 +282,18 @@ class Service:
                 report['complete'] = not report['errors'] and len(report['courses']) == len(self.config.courses)
                 report['complete'] = report['complete'] and all(len(v) == 6 for v in report['courses'].values())
                 self.store.set_state('last_scan', report)
+                if report['complete']:
+                    self.store.set_state('last_successful_scan', report)
             self.store.set_state('last_error', None)
             return report
 
-    async def scan_linked_files(self, course, verify_files=False):
+    async def scan_linked_files(self, course, verify_files=False, parents_complete=True):
         rows = self.store.db.execute('SELECT id FROM items WHERE course_id=? AND available=1 AND kind!=?',
                                      (course, 'linked_file')).fetchall()
         queue = deque(self.store.get(row[0]) for row in rows)
         found, visited, saved = {}, set(), 0
-        errors = []
+        errors = [] if parents_complete else [{'course': course, 'section': 'linked_file',
+            'message': 'Parent metadata or files are incomplete; preserving previously discovered links.'}]
         while queue:
             parent = queue.popleft()
             if parent['id'] in visited:
@@ -370,6 +411,7 @@ class Service:
                         max_keepalive_connections=self.config.download_concurrency))
             client = self.download_client
             for _ in range(6):
+                await self.browser.wait_for_cooldown()
                 cookies = await self.browser.cookies()
                 cookie_header = httpx.Request('GET', url, cookies=cookies).headers.get('cookie', '')
                 async with client.stream('GET', url, headers={'Cache-Control': 'no-cache', 'Cookie': cookie_header}) as response:
@@ -388,6 +430,7 @@ class Service:
                     if response.status_code == 401:
                         raise LoginRequired('Download requires sign-in.')
                     if response.status_code == 429:
+                        self.browser.rate_limit(response.headers.get('retry-after', '5'))
                         raise RateLimited('Download rate-limited; will retry on the next scan.')
                     response.raise_for_status()
                     size_header = response.headers.get('content-length')

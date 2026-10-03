@@ -81,3 +81,40 @@ def test_search_coverage_matches_course_filter_and_empty_results(tmp_path):
     assert store.search_documents('instructions', course_id='2')['index_coverage'] == {'total': 1, 'processed': 0}
     assert store.search_documents('instructions', course_id='3')['index_coverage'] == {'total': 0, 'processed': 0}
     store.close()
+
+
+async def test_cached_document_does_not_wait_for_parser_lock(tmp_path):
+    import asyncio
+    from courselink_mcp.config import Config
+    from courselink_mcp.service import Service
+    from courselink_mcp.extract import EXTRACTOR_VERSION
+    service = Service(Config(state=tmp_path, school=tmp_path))
+    cached = {'status': 'ok', 'text': 'Saved instructions', 'extractor_version': EXTRACTOR_VERSION}
+    service.store.save_document(1, cached)
+    try:
+        async with service.extract_lock:
+            result = await asyncio.wait_for(service.extract_document({'id': 1}), 0.5)
+        assert result == cached
+    finally:
+        await service.close()
+
+
+async def test_waiting_extraction_rechecks_cache_before_starting_worker(tmp_path, monkeypatch):
+    import asyncio
+    from courselink_mcp.config import Config
+    from courselink_mcp.service import Service
+    from courselink_mcp.extract import EXTRACTOR_VERSION
+    service = Service(Config(state=tmp_path, school=tmp_path))
+    cached = {'status': 'ok', 'text': 'Saved instructions', 'extractor_version': EXTRACTOR_VERSION}
+    async def forbidden(*args, **kwargs):
+        pytest.fail('A second worker must not parse the same cached version')
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', forbidden)
+    try:
+        async with service.extract_lock:
+            task = asyncio.create_task(service.extract_document({'id': 1}))
+            await asyncio.sleep(0)
+            assert not task.done()
+            service.store.save_document(1, cached)
+        assert await asyncio.wait_for(task, 0.5) == cached
+    finally:
+        await service.close()

@@ -166,3 +166,23 @@ async def test_failed_content_detail_cancels_other_workers():
     with pytest.raises(EndpointUnavailable):
         await asyncio.wait_for(Catalog(browser).content('1'), 2)
     assert second_cancelled.is_set()
+
+
+async def test_module_dates_and_instruction_changes_are_refetched_without_toc_change():
+    toc = {'Modules': [{'ModuleId': 1, 'Title': 'Week', 'Topics': []}]}
+    details = {'ModuleStartDate': '2026-10-01', 'ModuleEndDate': '2026-10-31',
+               'ModuleDueDate': '2026-10-07', 'Description': {'Text': 'Original instructions'}}
+    browser = FakeBrowser(toc)
+    calls = []
+    async def get(path):
+        calls.append(path)
+        return toc if path.endswith('/toc') else details
+    browser.get = get
+    catalog = Catalog(browser)
+    first = (await catalog.content('1'))[0]
+    details['ModuleDueDate'] = '2026-10-08'
+    details['Description'] = {'Text': 'Changed instructions'}
+    second = (await catalog.content('1'))[0]
+    assert first['start_date'] == '2026-10-01' and first['end_date'] == '2026-10-31'
+    assert first['due_date'] == '2026-10-07' and second['due_date'] == '2026-10-08'
+    assert second['description'] == 'Changed instructions' and len(calls) == 4
