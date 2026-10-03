@@ -77,7 +77,7 @@ uv run courselink mcp-config
 
 It contains the actual Python executable, private state location, and `stdio --start-service` arguments. Merge only its `courselink` entry into the user's private MCP configuration, preserving other servers and settings. For clients with a different schema, use the generated command, arguments, and environment in their supported format. Do not resolve the virtual environment's Python symlink to the base interpreter.
 
-The generated entry automatically starts the local monitor if it is offline and reuses it when already running. Startup remains private on localhost. For an explicitly configured remote HTTP service, use plain `stdio` without `--start-service` instead. The generic [mcp-client.json](mcp-client.json) is also available as a template.
+The generated entry automatically starts the local monitor if it is offline and reuses it when already running. Startup remains private on localhost. For an explicitly configured remote HTTP service, use plain `stdio` without `--start-service` instead. The generic [mcp-client.json](examples/mcp-client.json) is also available as a template.
 
 Reload the client's MCP connection and verify that CourseLink tools are visible. Do not claim connection success merely because a config was written. If the user must restart their app, say so clearly.
 
@@ -92,7 +92,7 @@ Request a scan with `check_now` or `uv run courselink check`, then wait for it t
 
 End with a short confirmation, the download location, and an example such as “Find the instructions for my next assignment.” Mention any remaining client restart or sign-in step. Do not promise permanent login: CourseLink can expire or revoke a session, requiring another browser sign-in.
 
-Monitoring runs only while its host and process stay running. The generated MCP entry can restart it when the client reconnects; it does not configure boot startup. For unattended Linux startup, adapt [deploy/courselink.service](deploy/courselink.service) to the actual clone/state paths and follow [docs/setup.md](docs/setup.md). Only claim boot startup is enabled after verifying it. For unattended reliability, follow [docs/reliability.md](docs/reliability.md) to configure and verify watchdog and backup timers.
+Monitoring runs only while its host and process stay running. The generated MCP entry can restart it when the client reconnects; it does not configure boot startup. For unattended Linux startup, adapt [deploy/systemd/courselink.service](deploy/systemd/courselink.service) to the actual clone/state paths and follow [docs/setup.md](docs/setup.md). Only claim boot startup is enabled after verifying it. For unattended reliability, follow [docs/reliability.md](docs/reliability.md) to configure and verify watchdog and backup timers.
 
 ## Keep personal data private
 
