@@ -1,6 +1,6 @@
 # CourseLink MCP
 
-<p align="center"><img src="assets/alfred-courselink.png" alt="Alfred smashing the CourseLink logo: downloaded." width="640"></p>
+<p align="center"><img src="assets/alfred-courselink.png" alt="Alfred mid-air hammer-smashing the CourseLink logo, with flying files and debris: downloaded." width="640"></p>
 
 got tired of opening CourseLink just to download assignment files, so I made this. plug it into Claude Code, Codex, or whatever you use that supports MCP and just ask for what you need.
 

@@ -119,7 +119,10 @@ async def test_document_reads_reuse_cache_but_allow_forced_refresh(download_serv
     await api.call('document', {'item_id': row['id'], 'refresh': True})
     assert calls == 2
     service.store.reconcile('1', 'content', [dict(row, title='Updated instructions')])
-    assert (await api.call('document', {'item_id': row['id']}))['freshly_checked']
+    cached = await api.call('document', {'item_id': row['id']})
+    assert cached['refresh_queued'] and not cached['freshly_checked'] and calls == 2
+    assert cached['source_checked_at'] and service.wake.is_set()
+    await api.call('document', {'item_id': row['id'], 'refresh': True})
     assert calls == 3
     service.browser.status = {'state': 'login_required'}
     cached = await api.call('document', {'item_id': row['id']})
@@ -227,3 +230,34 @@ async def test_full_scan_reports_link_failure_without_losing_successful_files(do
     assert report['duration_seconds'] >= 0 and report['files_saved'] == 1
     assert len(report['errors']) == 1 and report['errors'][0]['section'] == 'linked_file'
     assert report['courses']['1']['linked_file'] == 2
+
+
+async def test_topic_file_404_uses_same_origin_course_source(download_service):
+    service, row, mock = download_service
+    row = dict(row, source_url='/shared/instructions.pdf')
+    service.store.reconcile('1', 'content', [row])
+    paths = []
+    def handler(request):
+        paths.append(request.url.path)
+        if request.url.path.startswith('/d2l/api/'):
+            return httpx.Response(404)
+        return httpx.Response(200, content=b'%PDF-direct', headers={'content-type': 'application/pdf'})
+    mock(handler)
+    result = await service.download(row['id'])
+    assert result['new_version']
+    assert paths == [row['download_path'], '/shared/instructions.pdf']
+
+
+@pytest.mark.parametrize('source', ['https://evil.test/content/file.pdf', '/d2l/logout', '/content/%2e%2e/d2l/logout'])
+async def test_topic_fallback_never_follows_untrusted_sources(download_service, source):
+    service, row, mock = download_service
+    row = dict(row, source_url=source)
+    service.store.reconcile('1', 'content', [row])
+    paths = []
+    def handler(request):
+        paths.append(str(request.url))
+        return httpx.Response(404)
+    mock(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        await service.download(row['id'])
+    assert len(paths) == 1
