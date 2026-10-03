@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep seven daily CourseLink catalog snapshots
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

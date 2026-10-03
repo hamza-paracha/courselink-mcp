@@ -9,7 +9,6 @@ import sys
 import tempfile
 
 import httpx
-import uvicorn
 
 from .config import Config
 
@@ -95,6 +94,7 @@ def main():
             from .login import login
             asyncio.run(login())
         else:
+            import uvicorn
             from .server import create_app
             logging.basicConfig(level=logging.INFO)
             uvicorn.run(create_app(config), host=os.environ.get('COURSELINK_BIND', '127.0.0.1'),

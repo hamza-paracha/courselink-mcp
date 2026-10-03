@@ -64,3 +64,17 @@ def test_link_updates_preserve_other_links_until_full_reconciliation(tmp_path):
     store.reconcile('1', 'linked_file', [first])
     assert not store.get(second['id'])['available']
     store.close()
+
+
+def test_listing_preserves_item_details_without_per_item_queries(tmp_path):
+    store = Store(tmp_path / 'db')
+    rows = [dict(content(), id=f'1:content:{i}', title=f'Lab {i:03d}', category='lab',
+                 instructions={'Html': '<p>Read me</p>'}) for i in range(150)]
+    store.reconcile('1', 'content', rows)
+    expected = [store.get(row['id']) for row in rows[20:120]]
+    queries = []
+    store.db.set_trace_callback(queries.append)
+    result = store.items(course_id='1', kind='content', category='lab', limit=100, offset=20)
+    assert result == {'total': 150, 'items': expected, 'offset': 20}
+    assert len([query for query in queries if query.startswith('SELECT')]) == 2
+    store.close()

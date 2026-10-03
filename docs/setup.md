@@ -116,6 +116,8 @@ systemctl --user enable --now courselink.service
 journalctl --user -u courselink.service -n 50 --no-pager
 ```
 
+For stuck-process recovery and verified daily catalog backups, follow [reliability.md](reliability.md).
+
 To continue after logout, enable lingering for your own server account with `loginctl enable-linger` if your host permits it.
 
 Refresh a headless server session from a local clone with Chromium installed:
@@ -148,6 +150,7 @@ The service also provides MCP Streamable HTTP at `/mcp/` and REST endpoints unde
 | Route | Method | Parameters |
 | --- | --- | --- |
 | `/api/status` | GET | None |
+| `/api/health` | GET | Worker health only; requires the same bearer token |
 | `/api/courses` | GET | None |
 | `/api/items` | GET | `course_id`, `kind`, `query`, `limit`, `offset` |
 | `/api/materials` | GET | `course_id`, `material_type`, `limit`, `offset` |

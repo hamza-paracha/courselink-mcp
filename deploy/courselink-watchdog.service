@@ -1,0 +1,14 @@
+[Unit]
+Description=Check CourseLink workers and recover a stuck monitor
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/courselink-mcp
+Environment="COURSELINK_STATE_DIR=%h/.local/share/courselink-mcp"
+# Add --tunnel only if courselink-tunnel.service exposes localhost:8080/readyz.
+ExecStart=%h/courselink-mcp/.venv/bin/python -m courselink_mcp.maintenance watchdog
+TimeoutStartSec=180
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=256M

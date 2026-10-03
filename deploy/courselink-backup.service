@@ -1,0 +1,14 @@
+[Unit]
+Description=Back up the CourseLink catalog and verify its integrity
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/courselink-mcp
+Environment="COURSELINK_STATE_DIR=%h/.local/share/courselink-mcp"
+ExecStart=%h/courselink-mcp/.venv/bin/python -m courselink_mcp.maintenance backup
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=256M
+Nice=10
