@@ -54,7 +54,7 @@ uv run courselink mcp-config
 
 Merge the resulting `courselink` entry into your MCP client's private configuration. It uses the installed Python interpreter directly and automatically starts the local monitor when needed. Preserve other configured servers. Reload the client's MCP connection after adding it.
 
-Alternatively, adapt [mcp-client.json](../mcp-client.json), replacing its example clone path. If you use a custom `COURSELINK_STATE_DIR`, include that same value in the client's environment. The generated entry already includes it.
+Alternatively, adapt [mcp-client.json](../examples/mcp-client.json), replacing its example clone path. If you use a custom `COURSELINK_STATE_DIR`, include that same value in the client's environment. The generated entry already includes it.
 
 Plain `courselink stdio` connects to an existing monitor. `courselink stdio --start-service` starts a missing local monitor; it deliberately rejects custom server URL/token overrides. Use plain stdio for those remote configurations.
 
@@ -106,11 +106,11 @@ uv run courselink login
 
 Initial sign-in needs a graphical environment. For a headless server, use the remote login helper below from a computer with a browser. Set `"headless": true` in the server's private configuration before starting the service.
 
-[deploy/courselink.service](../deploy/courselink.service) is a user service template using the paths above. Adjust it for other installation paths, then install it:
+[deploy/systemd/courselink.service](../deploy/systemd/courselink.service) is a user service template using the paths above. Adjust it for other installation paths, then install it:
 
 ```sh
 mkdir -p ~/.config/systemd/user
-cp deploy/courselink.service ~/.config/systemd/user/
+cp deploy/systemd/courselink.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now courselink.service
 journalctl --user -u courselink.service -n 50 --no-pager

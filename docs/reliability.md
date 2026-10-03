@@ -4,7 +4,7 @@ The Python MCP SDK (FastMCP) handles the MCP protocol. A service manager keeps t
 
 ## Unattended Linux setup
 
-Install the service from [setup.md](setup.md) first. The optional units in `deploy/` add a watchdog and daily catalog backups. Adapt **every** `WorkingDirectory`, `ExecStart`, and `COURSELINK_STATE_DIR` to the existing clone and private state location before installing them. Never replace the private config or browser profile.
+Install the service from [setup.md](setup.md) first. The optional units in `deploy/systemd/` add a watchdog and daily catalog backups. Adapt **every** `WorkingDirectory`, `ExecStart`, and `COURSELINK_STATE_DIR` to the existing clone and private state location before installing them. Never replace the private config or browser profile.
 
 Copy the four `courselink-watchdog.*` and `courselink-backup.*` files into `~/.config/systemd/user/`, then run:
 
@@ -19,7 +19,7 @@ Enable user lingering (`loginctl enable-linger`) for operation after logout and 
 
 If an OpenAI tunnel runs as `courselink-tunnel.service` and its readiness endpoint is `http://127.0.0.1:8080/readyz`, append `--tunnel` to the watchdog's `ExecStart`. Keep tunnel credentials in its existing private environment file; never add them to these templates.
 
-The optional `deploy/courselink-tunnel.conf` drop-in adds restart limits and process restrictions without replacing tunnel configuration. Install it as `~/.config/systemd/user/courselink-tunnel.service.d/reliability.conf`, run `systemctl --user daemon-reload`, and restart the tunnel. Verify `/readyz` responds successfully afterward.
+The optional `deploy/systemd/courselink-tunnel.conf` drop-in adds restart limits and process restrictions without replacing tunnel configuration. Install it as `~/.config/systemd/user/courselink-tunnel.service.d/reliability.conf`, run `systemctl --user daemon-reload`, and restart the tunnel. Verify `/readyz` responds successfully afterward.
 
 ## What recovers automatically
 
