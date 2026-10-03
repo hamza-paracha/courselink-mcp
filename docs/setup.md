@@ -78,6 +78,25 @@ Try asking your client to check for new assignments, find a lab's instructions, 
 
 `read_document` reuses saved files by default. It downloads missing files. Saved copies return immediately; when metadata changes or a file recheck is due, it queues a background scan. Check `refresh_queued` and `source_checked_at` before claiming the latest contents. Set `refresh=True` to force an immediate remote check, or `refresh=False` to require a saved copy. Cached reads also work while signed out. The response reports whether it freshly checked the file or queued a refresh. If you need current bytes before answering, explicitly request `refresh=True`. Labels are inferred from titles and module paths; use `list_items` and full-text search when a lab or assignment is not grouped as expected. Text extraction has time, memory, and size limits. Inspect the original file for scanned pages, diagrams, layout-sensitive tables, unsupported formats, or truncated text. ZIP contents are read without executing or extracting them onto disk.
 
+## Use CourseLink in Claude chat
+
+CourseLink is an MCP server you connect to Claude, rather than a separate published CourseLink plugin in Anthropic’s directory. You can ask about deadlines, updates, and assignment instructions in a normal Claude conversation after setup. Claude Code is optional.
+
+### Claude Desktop with a local monitor
+
+1. Complete the local installation and CourseLink sign-in above.
+2. Run `uv run courselink mcp-config`. Merge its generated `courselink` entry into `mcpServers` in your private `claude_desktop_config.json`, preserving other entries. Use Claude Desktop’s Developer settings to locate its configuration. Keep the generated executable, arguments, and environment together.
+3. Restart Claude Desktop, then check Developer settings for the server’s connection status.
+4. In a normal chat, open **+ → Connectors**, enable CourseLink, and ask “anything new?” or “what does my next assignment require?”
+
+This local connection stays on your computer; it is not automatically available on claude.ai. See Anthropic’s [local MCP guide](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop).
+
+### Claude on the web with a remote monitor
+
+Claude’s remote connectors run through Anthropic’s servers, so a localhost URL will not work. After configuring authenticated HTTPS access to your monitor’s `/mcp/` endpoint, open **Customize → Connectors → Add custom connector**, name it CourseLink, and enter that endpoint. CourseLink uses a fixed bearer token: configure `Authorization: Bearer <your-private-token>` in the connector’s **Request headers**. Keep authentication enabled and the token private. Then enable CourseLink under **+ → Connectors** in your chat. Organization accounts may require an administrator to add the connector.
+
+Remote hosting and HTTPS access are additional setup; the local installation does not configure them. See Anthropic’s [custom connector guide](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp) for current controls and account availability.
+
 ## Monitoring and authentication
 
 Defaults are a session check every 60 seconds, a metadata scan targeting every 5 minutes from scan start to scan start, and same-URL file byte rechecks every hour. Scans do not overlap, and a scan that overruns its interval gets at least a 60-second pause before the next scheduled scan. These are polling targets, not a guarantee of instant updates: scans, rate limiting, upstream outages, and login expiry can delay freshness. `download_file` forces a recheck. Scans download up to three files concurrently and reuse connections. Set `download_concurrency` to 1–4 in the private config to tune this, then restart the monitor. Content details use two concurrent metadata requests by default (`api_concurrency`, configurable from 1–4 with a restart). A shared cooldown pauses new metadata requests and file downloads after rate limiting. Numeric and HTTP-date `Retry-After` values are honored; long delays defer work rather than retrying early. Output order and partial-failure protection are preserved. `api_metrics` and each scan’s `api_activity_during_scan` report requests, rate-limit responses, and aggregate request time; the scan window can include a concurrent session check. Each scan also records `phases`, with wall time per section and API request, queue, cooldown, success, error and cancellation counters attributed to that phase, excluding unrelated keepalives. Overlapping request/queue totals are not wall time. Cached document reads bypass the parser queue. Metadata details are still fetched on every scan: a TOC timestamp alone is not treated as proof that instructions or dates are unchanged. Metadata is indexed before file downloads so it becomes visible sooner. SHA-256 detects replaced bytes, and earlier versions remain available. The first scan is a discovery baseline, not evidence that the instructor just uploaded those files.
