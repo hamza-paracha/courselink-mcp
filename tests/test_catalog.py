@@ -88,3 +88,33 @@ def test_inline_file_discovery_is_scoped_to_course_links(tmp_path):
 def test_assessment_modules_are_included_with_assignments():
     assert category('Essay instructions', 'Assessments') == 'assignment'
     assert category('StudentInstruction', 'Labs/Lab1') == 'lab'
+
+
+def test_link_discovery_includes_unfamiliar_files_without_leaving_course_storage(tmp_path):
+    browser = BrowserSession(Config(state=tmp_path, school=tmp_path))
+    parent = {'id': '1:content:2', 'course_id': '1', 'title': 'Lab',
+              'source_url': '/content/enforced/1/page.html'}
+    html = '''<a href="starter.x68">Assembly</a><a href="diagram.png">Diagram</a>
+              <a href="download">Extensionless attachment</a><a href="/shared/data.weird">Data</a>
+              <a href="/content/">Directory</a><a href="/d2l/logout">Logout</a>
+              <a href="https://evil.test/content/a.pdf">External</a>
+              <a href="/content/%2e%2e/d2l/logout">Encoded traversal</a>'''
+    assert [row['filename'] for row in linked_files(parent, html, browser)] == [
+        'starter.x68', 'diagram.png', 'download', 'data.weird']
+
+
+async def test_shared_content_topics_are_downloadable():
+    toc = {'Modules': [{'Title': 'Files', 'Topics': [
+        {'TopicId': 7, 'Title': 'Instructions', 'Url': '/shared/instructions.pdf'}]}]}
+    rows = await Catalog(FakeBrowser(toc)).content('1')
+    assert rows[0]['download_path'].endswith('/topics/7/file')
+
+
+@pytest.mark.parametrize('method,raw', [
+    ('calendar', {'CalendarEventId': 2, 'Title': 'Event'}),
+    ('quizzes', {'QuizId': 2, 'Name': 'Quiz'}),
+])
+async def test_calendar_and_quiz_keep_links_for_file_discovery(method, raw):
+    description = {'Html': '<a href="/content/enforced/1/instructions.pdf">Read this</a>'}
+    rows = await getattr(Catalog(FakeBrowser([{**raw, 'Description': description}])), method)('1')
+    assert rows[0]['instructions'] == description

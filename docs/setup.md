@@ -161,7 +161,7 @@ The service also provides MCP Streamable HTTP at `/mcp/` and REST endpoints unde
 | `/api/versions` | GET | `item_id` |
 | `/api/download` | POST | `item_id` |
 | `/api/read_file` | POST | `version_id`, `offset`, `length` |
-| `/api/scan` | POST | `{}` |
+| `/api/scan` | POST | Optional `verify_files: true` to recheck every downloadable file |
 | `/api/login` | POST | `{}` |
 | `/api/files/{version_id}` | GET | Saved binary file |
 

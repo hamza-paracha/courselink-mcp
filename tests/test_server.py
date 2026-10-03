@@ -79,3 +79,40 @@ async def test_invalid_configuration_never_reports_complete_scan(setup):
     report = service.store.get_state('last_scan')
     assert not report['complete'] and report['errors']
     assert config.courses == {'1': 'example-course'}
+
+
+@pytest.mark.parametrize('declared_length', [None, '1', '70000'])
+async def test_post_body_limit_checks_stream_not_just_headers(setup, declared_length):
+    config, service = setup
+    async def chunks():
+        yield b'{"padding":"'
+        yield b'x' * 65536
+        raise AssertionError('Oversized request must stop being consumed immediately')
+    headers = {'Authorization': 'Bearer ' + config.token()}
+    if declared_length is not None:
+        headers['Content-Length'] = declared_length
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(config, service)), base_url='http://localhost') as client:
+        response = await client.post('/api/status', content=chunks(), headers=headers)
+        assert response.status_code == 413
+
+
+async def test_small_chunked_request_still_works_and_invalid_json_fails(setup):
+    config, service = setup
+    async def chunks():
+        yield b'{"limit":'
+        yield b'10}'
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(config, service)), base_url='http://localhost',
+                                 headers={'Authorization': 'Bearer ' + config.token()}) as client:
+        response = await client.post('/api/items', content=chunks())
+        assert response.status_code == 200 and response.json()['items'] == []
+        assert (await client.post('/api/items', content=b'{bad')).status_code == 400
+
+
+async def test_scan_request_preserves_thorough_check_when_requests_coalesce(setup):
+    _, service = setup
+    api = API(service)
+    assert (await api.call('scan', {'verify_files': True}))['verify_files']
+    assert (await api.call('scan', {}))['verify_files']
+    assert service.verify_files_requested and service.wake.is_set()
+    with pytest.raises(ValueError):
+        await api.call('scan', {'verify_files': 'false'})

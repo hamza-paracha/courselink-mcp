@@ -1,6 +1,7 @@
 import base64
 from contextlib import asynccontextmanager
 import hmac
+import json
 import os
 from pathlib import Path
 
@@ -104,9 +105,13 @@ def register_tools(mcp, call):
         return await call('read_file', dict(version_id=version_id, offset=offset, length=length))
 
     @mcp.tool()
-    async def check_now() -> dict:
-        """Queue a fresh scan. Returns immediately; poll courselink_status for completion."""
-        return await call('scan', {})
+    async def check_now(verify_files: bool = False) -> dict:
+        """Queue a fresh scan; poll courselink_status for completion.
+
+        Set verify_files=True to recheck every downloadable file, including byte changes
+        with unchanged metadata. This is slower; normal scans use the file-check interval.
+        """
+        return await call('scan', {'verify_files': verify_files})
 
     @mcp.tool()
     async def open_login() -> dict:
@@ -193,7 +198,7 @@ class API:
         if operation == 'download':
             return await service.download(**args)
         if operation == 'scan':
-            return service.request_scan()
+            return service.request_scan(**args)
         if operation == 'login':
             if not service.ready.is_set():
                 return {'message': 'Browser is starting. Retry shortly.'}
@@ -255,7 +260,12 @@ def create_app(config, service=None):
             else:
                 if int(request.headers.get('content-length', '0')) > 65536:
                     return JSONResponse({'error': 'Request too large.'}, 413)
-                args = await request.json()
+                body = bytearray()
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > 65536:
+                        return JSONResponse({'error': 'Request too large.'}, 413)
+                    body.extend(chunk)
+                args = json.loads(body)
                 if not isinstance(args, dict):
                     raise ValueError('Expected a JSON object.')
             return JSONResponse(await api.call(operation, args))
