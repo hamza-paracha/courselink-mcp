@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import json
 import sys
+import time
 from urllib.parse import unquote, urljoin
 
 import httpx
@@ -37,8 +38,10 @@ class Service:
         self.tasks = []
         self.ready = asyncio.Event()
         self.extract_lock = asyncio.Lock()
+        self.heartbeats = {}
 
     async def start(self):
+        self.heartbeats = {name: time.monotonic() for name in ('session', 'scan', 'index')}
         self.tasks = [asyncio.create_task(self.session_loop()), asyncio.create_task(self.scan_loop()),
                       asyncio.create_task(self.index_loop())]
 
@@ -46,29 +49,36 @@ class Service:
         for task in self.tasks:
             task.cancel()
         for task in self.tasks:
-            with suppress(asyncio.CancelledError):
+            with suppress(asyncio.CancelledError, Exception):
                 await task
-        await self.browser.close()
-        if self.download_client:
-            await self.download_client.aclose()
-        self.store.close()
+        try:
+            await self.browser.close()
+        finally:
+            try:
+                if self.download_client:
+                    await self.download_client.aclose()
+            finally:
+                self.store.close()
 
     async def session_loop(self):
         while True:
             try:
                 if self.browser.context is None or self.browser.closed:
-                    if self.browser.context is not None:
-                        await self.browser.close()
-                    await self.browser.start()
+                    if self.browser.playwright is not None:
+                        await asyncio.wait_for(self.browser.close(), 30)
+                    await asyncio.wait_for(self.browser.start(), 60)
                     self.ready.set()
                 previous = self.browser.status.get('state')
-                await self.browser.keepalive()
+                await asyncio.wait_for(self.browser.keepalive(), 180)
                 if previous != 'authenticated' and self.browser.status['state'] == 'authenticated':
                     self.wake.set()
             except Exception as exc:
+                if isinstance(exc, TimeoutError):
+                    self.browser.closed = True
                 log.warning('Browser health check failed: %s', type(exc).__name__)
                 self.browser.status = {'state': 'connection_error', 'message': str(exc)[:300],
                                        'last_verified': self.browser.status.get('last_verified')}
+            self.heartbeats['session'] = time.monotonic()
             await asyncio.sleep(self.config.keepalive_seconds)
 
     async def scan_loop(self):
@@ -77,17 +87,30 @@ class Service:
             self.wake.clear()
             if self.browser.status.get('state') == 'authenticated':
                 try:
-                    await self.scan()
+                    await asyncio.wait_for(self.scan(), 1800)
                 except Exception as exc:
                     log.warning('CourseLink scan failed: %s', type(exc).__name__)
                     self.store.set_state('last_error', {'time': now(), 'message': str(exc)[:300]})
+            self.heartbeats['scan'] = time.monotonic()
             try:
                 await asyncio.wait_for(self.wake.wait(), self.config.poll_seconds)
             except asyncio.TimeoutError:
                 pass
 
+    def health(self):
+        # Login expiry and upstream outages do not make the local process unhealthy.
+        # Detect dead workers and missed progress, rather than restarting for MFA.
+        limits = {'session': self.config.keepalive_seconds + 300,
+                  'scan': self.config.poll_seconds + 1860, 'index': 600}
+        current = time.monotonic()
+        stalled = [name for name, limit in limits.items()
+                   if current - self.heartbeats.get(name, 0) > limit]
+        workers_alive = len(self.tasks) == 3 and all(not task.done() for task in self.tasks)
+        return {'healthy': workers_alive and not stalled, 'workers_alive': workers_alive,
+                'stalled_workers': stalled}
+
     def status(self):
-        return {'session': self.browser.status, 'scanning': self.scan_lock.locked(),
+        return {'health': self.health(), 'session': self.browser.status, 'scanning': self.scan_lock.locked(),
                 'last_scan': self.store.get_state('last_scan'), 'last_error': self.store.get_state('last_error'),
                 'poll_seconds': self.config.poll_seconds, 'file_check_seconds': self.config.file_check_seconds,
                 'downloads': {'active': self.active_downloads, 'concurrency': self.config.download_concurrency},
@@ -129,13 +152,19 @@ class Service:
 
     async def index_loop(self):
         while True:
+            delay = 5
             try:
-                for version in self.store.pending_documents():
+                self.heartbeats['index'] = time.monotonic()
+                pending = self.store.pending_documents()
+                for version in pending:
                     await self.extract_document(version)
+                    self.heartbeats['index'] = time.monotonic()
                     await asyncio.sleep(0.1)
+                if pending:
+                    delay = 0  # Keep draining a backlog; idle polling still sleeps.
             except Exception as exc:
                 log.warning('Text index failed: %s', type(exc).__name__)
-            await asyncio.sleep(5)
+            await asyncio.sleep(delay)
 
     async def scan(self):
         async with self.scan_lock:
@@ -181,6 +210,9 @@ class Service:
                         raise
                     except Exception as exc:
                         report['errors'].append({'course': course, 'section': 'linked_file', 'message': str(exc)[:250]})
+            except asyncio.CancelledError:
+                report['errors'].append({'section': 'scan', 'message': 'Scan interrupted or exceeded its time limit.'})
+                raise
             except LoginRequired:
                 self.browser.status = {'state': 'login_required', 'message': 'Please sign in again.'}
                 report['errors'].append({'section': 'session', 'message': 'Sign in again.'})

@@ -92,7 +92,7 @@ Request a scan with `check_now` or `uv run courselink check`, then wait for it t
 
 End with a short confirmation, the download location, and an example such as “Find the instructions for my next assignment.” Mention any remaining client restart or sign-in step. Do not promise permanent login: CourseLink can expire or revoke a session, requiring another browser sign-in.
 
-Monitoring runs only while its host and process stay running. The generated MCP entry can restart it when the client reconnects; it does not configure boot startup. For unattended Linux startup, adapt [deploy/courselink.service](deploy/courselink.service) to the actual clone/state paths and follow [docs/setup.md](docs/setup.md). Only claim boot startup is enabled after verifying it.
+Monitoring runs only while its host and process stay running. The generated MCP entry can restart it when the client reconnects; it does not configure boot startup. For unattended Linux startup, adapt [deploy/courselink.service](deploy/courselink.service) to the actual clone/state paths and follow [docs/setup.md](docs/setup.md). Only claim boot startup is enabled after verifying it. For unattended reliability, follow [docs/reliability.md](docs/reliability.md) to configure and verify watchdog and backup timers.
 
 ## Keep personal data private
 

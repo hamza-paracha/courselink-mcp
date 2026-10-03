@@ -1,0 +1,10 @@
+[Unit]
+Description=Check CourseLink health every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

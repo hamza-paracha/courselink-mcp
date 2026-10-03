@@ -4,7 +4,6 @@ import re
 from urllib.parse import urljoin, urlsplit
 
 import httpx
-from playwright.async_api import async_playwright
 
 from .store import now
 
@@ -34,6 +33,7 @@ class BrowserSession:
         self.closed = True
 
     async def start(self):
+        from playwright.async_api import async_playwright
         self.playwright = await async_playwright().start()
         profile = self.config.state / 'browser-profile'
         profile.mkdir(exist_ok=True, mode=0o700)
@@ -58,13 +58,15 @@ class BrowserSession:
             self.status = {'state': 'login_required', 'message': 'Open the browser and sign in.'}
 
     async def close(self):
-        if self.context:
-            await self.context.close()
-        if self.playwright:
-            await self.playwright.stop()
-        self.context = None
-        self.playwright = None
+        context, playwright = self.context, self.playwright
+        self.context = self.playwright = self.page = None
         self.closed = True
+        try:
+            if context:
+                await context.close()
+        finally:
+            if playwright:
+                await playwright.stop()
 
     def url(self, path):
         url = urljoin(self.config.base_url + '/', path)

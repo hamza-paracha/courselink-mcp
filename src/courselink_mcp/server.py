@@ -11,7 +11,6 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 
 from .browser import LoginRequired
-from .service import Service
 
 
 def register_tools(mcp, call):
@@ -140,6 +139,8 @@ class API:
             args['course_id'] = self.course_id(args['course_id'])
         if operation == 'status':
             return service.status()
+        if operation == 'health':
+            return service.health()
         if operation == 'courses':
             return {'courses': store.courses(), 'last_scan': store.get_state('last_scan')}
         if operation == 'items':
@@ -230,6 +231,7 @@ class BearerAuth:
 
 
 def create_app(config, service=None):
+    from .service import Service
     service = service or Service(config)
     api = API(service)
     mcp = FastMCP('CourseLink', instructions=(
@@ -244,7 +246,7 @@ def create_app(config, service=None):
         try:
             operation = request.path_params['operation']
             if request.method == 'GET':
-                if operation not in {'status', 'courses', 'items', 'item', 'changes', 'versions', 'materials', 'search_documents'}:
+                if operation not in {'status', 'health', 'courses', 'items', 'item', 'changes', 'versions', 'materials', 'search_documents'}:
                     return JSONResponse({'error': 'Use POST for this operation.'}, 405)
                 args = dict(request.query_params)
                 for key in ('limit', 'offset', 'after'):
@@ -303,7 +305,7 @@ def stdio(config):
             client = connection
             yield
 
-    mcp = FastMCP('CourseLink', lifespan=lifespan)
+    mcp = FastMCP('CourseLink', lifespan=lifespan, log_level='WARNING')
 
     async def call(operation, args):
         response = await client.post(base + '/api/' + operation, json=args)

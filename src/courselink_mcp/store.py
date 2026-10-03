@@ -105,6 +105,10 @@ class Store:
         row = self.db.execute('SELECT * FROM items WHERE id=?', (item_id,)).fetchone()
         if not row:
             raise ValueError('Unknown item ID. Use list_items first.')
+        return self.item_data(row)
+
+    @staticmethod
+    def item_data(row):
         return {**json.loads(row['data']), 'available': bool(row['available']),
                 'first_seen': row['first_seen'], 'last_seen': row['last_seen']}
 
@@ -125,9 +129,9 @@ class Store:
             params.append(category)
         where = ' AND '.join(clauses)
         total = self.db.execute('SELECT count(*) FROM items WHERE ' + where, params).fetchone()[0]
-        rows = self.db.execute('SELECT id FROM items WHERE ' + where + ' ORDER BY course_id,kind,title LIMIT ? OFFSET ?',
+        rows = self.db.execute('SELECT data,available,first_seen,last_seen FROM items WHERE ' + where + ' ORDER BY course_id,kind,title LIMIT ? OFFSET ?',
                               params + [min(max(limit, 1), 500), max(0, offset)]).fetchall()
-        return {'total': total, 'items': [self.get(r[0]) for r in rows], 'offset': max(0, offset)}
+        return {'total': total, 'items': [self.item_data(row) for row in rows], 'offset': max(0, offset)}
 
     def document(self, version_id):
         row = self.db.execute('SELECT result FROM documents WHERE version_id=?', (version_id,)).fetchone()
