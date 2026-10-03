@@ -83,7 +83,7 @@ Reload the client's MCP connection and verify that CourseLink tools are visible.
 
 ## 6. Verify and hand off
 
-Request a scan with `check_now` or `uv run courselink check`, then wait for it to finish. Check:
+Request a scan with `check_now(force_refresh=True)` or `uv run courselink check`, then wait for it to finish. Check:
 
 - `courselink_status` shows authentication, the intended monitored courses, and a finished scan. Read its coverage/errors; report partial scans accurately.
 - `list_items` or `list_materials` returns available material for a selected course.

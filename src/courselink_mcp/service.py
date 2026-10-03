@@ -109,6 +109,7 @@ class Service:
     async def scan_loop(self):
         await self.ready.wait()
         while True:
+            cycle_started = time.monotonic()
             self.wake.clear()
             if self.browser.status.get('state') == 'authenticated':
                 try:
@@ -119,8 +120,10 @@ class Service:
                     log.warning('CourseLink scan failed: %s', type(exc).__name__)
                     self.store.set_state('last_error', {'time': now(), 'message': str(exc)[:300]})
             self.heartbeats['scan'] = time.monotonic()
+            # Aim for start-to-start polling, without hammering CourseLink after a slow scan.
+            delay = max(60, self.config.poll_seconds - (time.monotonic() - cycle_started))
             try:
-                await asyncio.wait_for(self.wake.wait(), self.config.poll_seconds)
+                await asyncio.wait_for(self.wake.wait(), delay)
             except asyncio.TimeoutError:
                 pass
 
@@ -138,6 +141,7 @@ class Service:
 
     def status(self):
         return {'health': self.health(), 'session': self.browser.status, 'scanning': self.scan_lock.locked(),
+                'freshness': self.freshness(),
                 'last_scan': self.store.get_state('last_scan'), 'last_error': self.store.get_state('last_error'),
                 'poll_seconds': self.config.poll_seconds, 'file_check_seconds': self.config.file_check_seconds,
                 'downloads': {'active': self.active_downloads, 'concurrency': self.config.download_concurrency},

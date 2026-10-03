@@ -111,11 +111,93 @@ async def test_small_chunked_request_still_works_and_invalid_json_fails(setup):
 async def test_scan_request_preserves_thorough_check_when_requests_coalesce(setup):
     _, service = setup
     api = API(service)
-    assert (await api.call('scan', {'verify_files': True}))['verify_files']
-    assert (await api.call('scan', {}))['verify_files']
+    assert (await api.call('scan', {'verify_files': True, 'force_refresh': True}))['verify_files']
+    assert (await api.call('scan', {'force_refresh': True}))['verify_files']
     assert service.verify_files_requested and service.wake.is_set()
     with pytest.raises(ValueError):
         await api.call('scan', {'verify_files': 'false'})
+    with pytest.raises(ValueError):
+        await api.call('scan', {'force_refresh': 'false'})
+
+
+@pytest.mark.parametrize('arguments', [{}, {'verify_files': True}, {'force_refresh': False}])
+async def test_legacy_scan_api_cannot_bypass_cache_default(setup, arguments):
+    _, service = setup
+    result = await API(service).call('scan', arguments)
+    assert result['source'] == 'cache' and result['queued'] is False
+    assert 'freshness' in result
+    assert not service.wake.is_set() and not service.verify_files_requested
+
+
+async def test_overdue_cache_reads_do_not_scan_or_wait(setup):
+    from datetime import datetime, timezone, timedelta
+    _, service = setup
+    checked = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    service.store.set_state('last_scan', {'complete': True, 'finished_at': checked})
+    service.browser.status = {'state': 'login_required'}
+    service.store.reconcile('1', 'assignment', [
+        {'id': '1:assignment:2', 'course_id': '1', 'kind': 'assignment', 'title': 'Cached assignment'}])
+    async def forbidden(*args, **kwargs):
+        raise AssertionError('Cached reads must not contact CourseLink')
+    service.scan = forbidden
+    service.catalog.courses = forbidden
+    api = API(service)
+    async with service.scan_lock:
+        changes = await api.call('changes', {})
+        items = await api.call('items', {})
+        status = await api.call('status', {})
+    assert items['items'][0]['title'] == 'Cached assignment'
+    assert changes['freshness']['checked_at'] == checked
+    assert changes['freshness']['refresh_due']
+    assert changes['freshness']['session_state'] == 'login_required'
+    assert status['freshness'] == changes['freshness']
+    assert not service.wake.is_set()
+
+
+@pytest.mark.parametrize('arguments', [{}, {'verify_files': True}, {'force_refresh': False}])
+async def test_check_now_defaults_to_cache_even_for_legacy_clients(setup, arguments):
+    from courselink_mcp.server import register_tools
+    _, service = setup
+    registered = {}
+    class Registry:
+        def tool(self):
+            def register(fn):
+                registered[fn.__name__] = fn
+                return fn
+            return register
+    register_tools(Registry(), API(service).call)
+    async with service.scan_lock:
+        result = await registered['check_now'](**arguments)
+    assert result['source'] == 'cache' and result['queued'] is False
+    assert 'freshness' in result and 'next_cursor' in result
+    assert not service.wake.is_set() and not service.verify_files_requested
+    forced = await registered['check_now'](force_refresh=True, verify_files=True)
+    assert forced['queued'] and service.wake.is_set() and service.verify_files_requested
+
+
+@pytest.mark.parametrize('scan_seconds,expected_delay', [(7, 293), (400, 60)])
+async def test_background_poll_accounts_for_scan_time(setup, monkeypatch, scan_seconds, expected_delay):
+    import asyncio
+    from types import SimpleNamespace
+    import courselink_mcp.service as service_module
+    _, service = setup
+    service.ready.set()
+    service.browser.status = {'state': 'authenticated'}
+    current = 1000
+    monkeypatch.setattr(service_module, 'time', SimpleNamespace(monotonic=lambda: current))
+    async def scan(verify_files=False):
+        nonlocal current
+        current += scan_seconds
+    service.scan = scan
+    async def wait_for(awaitable, timeout):
+        if timeout == 1800:
+            return await awaitable
+        awaitable.close()
+        assert timeout == expected_delay
+        raise asyncio.CancelledError
+    monkeypatch.setattr(asyncio, 'wait_for', wait_for)
+    with pytest.raises(asyncio.CancelledError):
+        await service.scan_loop()
 
 
 async def test_parent_failure_preserves_links_and_reports_stale_cache(setup):

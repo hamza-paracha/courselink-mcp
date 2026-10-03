@@ -106,7 +106,7 @@ def main():
     with httpx.Client(headers={'Authorization': 'Bearer ' + token}, timeout=180, trust_env=False) as client:
         if args.command in ('status', 'check', 'courses'):
             operation = {'status': 'status', 'check': 'scan', 'courses': 'courses'}[args.command]
-            arguments = {'verify_files': args.verify_files} if args.command == 'check' else {}
+            arguments = {'verify_files': args.verify_files, 'force_refresh': True} if args.command == 'check' else {}
             response = client.post(base + '/api/' + operation, json=arguments)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
