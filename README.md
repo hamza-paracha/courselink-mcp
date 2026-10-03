@@ -2,16 +2,25 @@
 
 <p align="center"><img src="assets/alfred-courselink.png" alt="Alfred mid-air hammer-smashing the CourseLink logo, with flying files and debris: downloaded." width="640"></p>
 
-got tired of opening CourseLink, clicking through every course, and downloading assignments one by one. so i made this. connect it to ChatGPT, Claude, or another assistant that supports MCP and just ask.
+got tired of opening CourseLink, clicking through every course, and downloading assignments one by one. so i made this. connect your own University of Guelph CourseLink account to your AI assistant and just ask.
 
-- **use it right in chat.** once you connect your own monitor as a private ChatGPT plugin, select CourseLink in the chat (or mention `@CourseLink` when available) and ask about your courses. you can use it entirely through chat after setup, without opening a coding agent or running commands for each question. [OpenAI’s connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt) covers connecting and selecting the plugin.
-- **Claude chats work too.** Claude Desktop can connect to the local monitor through its MCP configuration, then you enable CourseLink from **+ → Connectors** and ask in a normal chat. Claude on the web uses a remote custom connector with a reachable, authenticated server. [Claude chat setup](docs/setup.md#use-courselink-in-claude-chat) covers both. Claude Code is an optional coding workflow, not a requirement.
-- **“anything new?”** reads cached posts, changed instructions, and due dates immediately. the monitor targets a refresh every 5 minutes while running. routine checks use the cache; a forced scan needs an explicit refresh request. answers include when the data was last checked.
-- **“what do i need for this assignment?”** pulls the instructions and searches inside downloaded files.
-- **files ready when you sit down.** set up automatic sync and new or changed files land in the right course folders when your computer is online. sync skips identical files already there and keeps older versions when files change. open the folder in Claude Code, Codex, Hermes, or another local assistant to work with the downloaded instructions and starter files, understand the assignment, and get help as you work.
+## what you can do
 
-sign in through the separate browser window, pick your courses, and you're set. it saves your session; if CourseLink logs you out, just sign in again. runs locally or on a server, with remote access for supported clients.
+- **check in from chat.** after connecting your monitor, select CourseLink in ChatGPT (or mention `@CourseLink` when available) and ask “anything new?” or “what’s due next?” Claude works through connectors too. you don’t need a coding agent for everyday use.
+- **get the assignment details.** ask “what do i need for this assignment?” to find instructions and search downloaded documents.
+- **have files ready to work with.** the monitor downloads course files and keeps older versions when they change. if it runs remotely, optional sync brings them to your computer. open the course folder in Codex, Claude Code, Hermes, or another local assistant to get help with the material.
 
-built for University of Guelph CourseLink. for setup, clone it and follow the [setup guide](docs/setup.md), or ask a coding assistant: “set this up using [AGENTS.md](AGENTS.md).” ChatGPT needs a supported connection to your monitor; a local MCP client can connect directly on your computer. each person signs into their own CourseLink account and picks their own courses.
+routine update checks read the cache immediately. background metadata scans target every 5 minutes while running; unchanged-looking files get byte checks hourly. results include when the data was last checked.
+
+## where it runs
+
+- **on your computer by default.** no separate server needed. monitoring runs while your computer is awake and the process is running. Claude Desktop can connect locally, and saved files stay available offline.
+- **on a server if you want it always running.** handy when your laptop is off or you’re on the go: open a supported chat client, select CourseLink, and see what’s up. ChatGPT and Claude web need a supported remote connection or authenticated tunnel to reach the monitor—even when it runs on your computer. remote access takes extra setup.
+
+## getting started
+
+clone this repo and follow the [setup guide](docs/setup.md), or ask a coding assistant: **“set this up using [AGENTS.md](AGENTS.md).”** it handles installation and configuration; you sign in through the browser, complete MFA, and choose your courses. if CourseLink expires your session, sign in again.
+
+[Claude chat setup](docs/setup.md#use-courselink-in-claude-chat) · [ChatGPT connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt) · [server reliability](docs/reliability.md)
 
 made by [@hamza-paracha](https://github.com/hamza-paracha).
