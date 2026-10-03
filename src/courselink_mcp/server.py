@@ -82,7 +82,10 @@ def register_tools(mcp, call):
         """Read discovered/updated material and downloaded file changes since a cursor.
 
         The first scan is an initial discovery baseline, not proof those files were just uploaded.
-        Preserve next_cursor to request only newer changes next time.
+        Preserve next_cursor to request only newer changes next time. Results come from the
+        background monitor's cache: report freshness.checked_at when answering 'anything new?'.
+        If refresh_due or latest_scan_complete is false, explain that coverage may be stale/partial.
+        Use check_now and wait for a completed scan when the user explicitly wants a fresh check.
         """
         return await call('changes', dict(after=after, limit=limit, course_id=course_id))
 
@@ -148,16 +151,17 @@ class API:
         if operation == 'health':
             return service.health()
         if operation == 'courses':
-            return {'courses': store.courses(), 'last_scan': store.get_state('last_scan')}
+            return {'courses': store.courses(), 'last_scan': store.get_state('last_scan'), 'freshness': service.freshness()}
         if operation == 'items':
-            return store.items(**args)
+            return {**store.items(**args), 'freshness': service.freshness()}
         if operation == 'materials':
             material_type = args.pop('material_type', 'lab')
             if material_type not in ('lab', 'assignment'):
                 raise ValueError('material_type must be lab or assignment.')
-            return {**store.items(category=material_type, **args), 'last_scan': store.get_state('last_scan')}
+            return {**store.items(category=material_type, **args), 'last_scan': store.get_state('last_scan'),
+                    'freshness': service.freshness()}
         if operation == 'search_documents':
-            return store.search_documents(**args)
+            return {**store.search_documents(**args), 'freshness': service.freshness()}
         if operation == 'document':
             row = store.get(args['item_id'])
             offset, length = int(args.get('offset', 0)), int(args.get('length', 20000))
@@ -200,7 +204,7 @@ class API:
         if operation == 'item':
             return store.get(**args)
         if operation == 'changes':
-            return store.changes(**args)
+            return {**store.changes(**args), 'freshness': service.freshness()}
         if operation == 'versions':
             return {'versions': store.versions(**args)}
         if operation == 'download':

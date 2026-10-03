@@ -261,3 +261,45 @@ async def test_topic_fallback_never_follows_untrusted_sources(download_service, 
     with pytest.raises(httpx.HTTPStatusError):
         await service.download(row['id'])
     assert len(paths) == 1
+
+
+async def test_download_rate_limit_also_gates_metadata(download_service):
+    import time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from courselink_mcp.browser import RateLimited
+    service, row, mock = download_service
+    mock(lambda request: httpx.Response(429, headers={'retry-after': '120'}))
+    with pytest.raises(RateLimited):
+        await service.download(row['id'])
+    assert service.browser.rate_limited_until - time.monotonic() > 119
+    request = AsyncMock()
+    service.browser.context = SimpleNamespace(request=SimpleNamespace(get=request), close=AsyncMock())
+    service.browser.closed = False
+    with pytest.raises(RateLimited):
+        await service.browser.get('/d2l/api/example')
+    with pytest.raises(RateLimited):
+        await service.download(row['id'])
+    request.assert_not_called()
+    assert not list(service.config.school.rglob('*.partial'))
+
+
+async def test_failed_parent_html_refresh_keeps_previous_link_index(download_service):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+    service, row, mock = download_service
+    parent = dict(row, filename='index.html', source_url='/content/index.html')
+    service.store.reconcile('1', 'content', [parent])
+    saved = service.config.state / 'old-page'
+    saved.write_text('<p>Old cached page</p>')
+    service.store.record_file(parent, saved, service.config.state / 'page.html', 'synthetic', 22)
+    old = {'id': '1:linked_file:old', 'course_id': '1', 'kind': 'linked_file', 'title': 'Keep previous link'}
+    service.store.upsert_link(old)
+    service.catalog.courses = AsyncMock(return_value=[{'id': '1'}])
+    service.catalog.content = AsyncMock(return_value=[parent])
+    for name in ('assignments', 'announcements', 'calendar', 'quizzes'):
+        setattr(service.catalog, name, AsyncMock(return_value=[]))
+    mock(lambda request: httpx.Response(500))
+    report = await service.scan(verify_files=True)
+    assert not report['complete'] and service.store.get(old['id'])['available']
+    assert any('Parent metadata or files' in e['message'] for e in report['errors'])
