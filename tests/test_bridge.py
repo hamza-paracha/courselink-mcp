@@ -44,7 +44,11 @@ async def test_real_stdio_bridge_reuses_http_connection(tmp_path, monkeypatch):
     try:
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                initialized = await session.initialize()
+                assert 'Answer routine questions from the background monitor cache' in initialized.instructions
+                tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                assert 'Return promptly without check_now' in tools['list_changes'].description
+                assert tools['check_now'].inputSchema['properties']['force_refresh']['default'] is False
                 for _ in range(2):
                     result = await session.call_tool('courselink_status')
                     assert not result.isError
