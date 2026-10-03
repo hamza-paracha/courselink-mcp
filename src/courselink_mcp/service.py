@@ -39,6 +39,7 @@ class Service:
         self.ready = asyncio.Event()
         self.extract_lock = asyncio.Lock()
         self.heartbeats = {}
+        self.verify_files_requested = False
 
     async def start(self):
         self.heartbeats = {name: time.monotonic() for name in ('session', 'scan', 'index')}
@@ -87,7 +88,9 @@ class Service:
             self.wake.clear()
             if self.browser.status.get('state') == 'authenticated':
                 try:
-                    await asyncio.wait_for(self.scan(), 1800)
+                    verify_files = self.verify_files_requested
+                    self.verify_files_requested = False
+                    await asyncio.wait_for(self.scan(verify_files=verify_files), 1800)
                 except Exception as exc:
                     log.warning('CourseLink scan failed: %s', type(exc).__name__)
                     self.store.set_state('last_error', {'time': now(), 'message': str(exc)[:300]})
@@ -116,11 +119,19 @@ class Service:
                 'downloads': {'active': self.active_downloads, 'concurrency': self.config.download_concurrency},
                 'monitored_courses': self.config.courses, 'api_versions': self.browser.versions,
                 'text_index': self.store.index_status(),
+                'coverage_scope': 'Accessible content, assignments, announcements, calendar and quiz metadata '
+                    'for selected courses, plus linked files under CourseLink /content/ and /shared/. '
+                    'Hidden/locked material, external services and quiz questions are outside this scope. '
+                    'A complete scan does not guarantee every file is text-extractable; inspect text_index and document warnings.',
                 'note': 'Cached results remain readable offline. The host running this service must be online for monitoring.'}
 
-    def request_scan(self):
+    def request_scan(self, verify_files=False):
+        if type(verify_files) is not bool:
+            raise ValueError('verify_files must be true or false.')
+        self.verify_files_requested = self.verify_files_requested or verify_files
         self.wake.set()
-        return {'queued': True, 'session': self.browser.status, 'already_scanning': self.scan_lock.locked()}
+        return {'queued': True, 'verify_files': self.verify_files_requested,
+                'session': self.browser.status, 'already_scanning': self.scan_lock.locked()}
 
     async def extract_document(self, version, member=None):
         async with self.extract_lock:
@@ -166,9 +177,11 @@ class Service:
                 log.warning('Text index failed: %s', type(exc).__name__)
             await asyncio.sleep(delay)
 
-    async def scan(self):
+    async def scan(self, verify_files=False):
         async with self.scan_lock:
+            started = time.monotonic()
             report = {'started_at': now(), 'finished_at': None, 'courses': {}, 'errors': [], 'files_saved': 0}
+            report['verify_files'] = verify_files
             try:
                 settings_path = self.config.state / 'config.json'
                 if settings_path.exists():
@@ -201,11 +214,12 @@ class Service:
                             raise
                         except Exception as exc:
                             report['errors'].append({'course': course, 'section': kind, 'message': str(exc)[:250]})
-                    await self.download_rows(course, pending, report)
+                    await self.download_rows(course, pending, report, verify_files=verify_files)
                     try:
-                        linked_count, saved = await self.scan_linked_files(course)
+                        linked_count, saved, errors = await self.scan_linked_files(course, verify_files=verify_files)
                         report['courses'][course]['linked_file'] = linked_count
                         report['files_saved'] += saved
+                        report['errors'].extend(errors)
                     except (LoginRequired, RateLimited):
                         raise
                     except Exception as exc:
@@ -221,6 +235,7 @@ class Service:
                 report['errors'].append({'section': 'scan', 'message': str(exc)[:250]})
                 raise
             finally:
+                report['duration_seconds'] = round(time.monotonic() - started, 3)
                 report['finished_at'] = now()
                 report['complete'] = not report['errors'] and len(report['courses']) == len(self.config.courses)
                 report['complete'] = report['complete'] and all(len(v) == 6 for v in report['courses'].values())
@@ -228,11 +243,12 @@ class Service:
             self.store.set_state('last_error', None)
             return report
 
-    async def scan_linked_files(self, course):
+    async def scan_linked_files(self, course, verify_files=False):
         rows = self.store.db.execute('SELECT id FROM items WHERE course_id=? AND available=1 AND kind!=?',
                                      (course, 'linked_file')).fetchall()
         queue = deque(self.store.get(row[0]) for row in rows)
         found, visited, saved = {}, set(), 0
+        errors = []
         while queue:
             parent = queue.popleft()
             if parent['id'] in visited:
@@ -253,8 +269,14 @@ class Service:
             if (parent.get('filename') or '').lower().endswith(('.html', '.htm')):
                 versions = self.store.versions(parent['id'])
                 if not versions:
-                    raise ValueError('An HTML course page could not be downloaded; link coverage is incomplete.')
-                documents.append(Path(versions[0]['path']).read_text(errors='replace'))
+                    errors.append({'course': course, 'item': parent['id'], 'section': 'linked_file',
+                                   'message': 'HTML page unavailable; link coverage is incomplete.'})
+                else:
+                    try:
+                        documents.append(Path(versions[0]['path']).read_text(errors='replace'))
+                    except OSError as exc:
+                        errors.append({'course': course, 'item': parent['id'], 'section': 'linked_file',
+                                       'message': type(exc).__name__})
             for document in documents:
                 for child in linked_files(parent, document, self.browser):
                     if child['id'] in found:
@@ -262,16 +284,22 @@ class Service:
                     found[child['id']] = child
                     # Reconcile only the full set at the end; incremental upserts must not hide other links.
                     self.store.upsert_link(child)
-                    if self.store.needs_download(child, self.config.file_check_seconds):
-                        result = await self.download(child['id'])
-                        saved += int(result['new_version'])
+                    try:
+                        if verify_files or self.store.needs_download(child, self.config.file_check_seconds):
+                            result = await self.download(child['id'])
+                            saved += int(result['new_version'])
+                    except (LoginRequired, RateLimited):
+                        raise
+                    except Exception as exc:
+                        errors.append({'course': course, 'item': child['id'], 'section': 'linked_file',
+                                       'message': str(exc)[:250]})
                     queue.append(child)
-        self.store.reconcile(course, 'linked_file', list(found.values()))
-        return len(found), saved
+        self.store.reconcile(course, 'linked_file', list(found.values()), mark_missing=not errors)
+        return len(found), saved, errors
 
-    async def download_rows(self, course, rows, report):
+    async def download_rows(self, course, rows, report, verify_files=False):
         pending = iter(row for row in rows if row.get('download_path')
-                       and self.store.needs_download(row, self.config.file_check_seconds))
+                       and (verify_files or self.store.needs_download(row, self.config.file_check_seconds)))
 
         async def worker():
             for row in pending:

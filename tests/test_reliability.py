@@ -69,7 +69,7 @@ async def test_cancelled_scan_never_reports_complete(config):
     for name in ('content', 'assignments', 'announcements', 'calendar', 'quizzes'):
         setattr(service.catalog, name, AsyncMock(return_value=[]))
     started = asyncio.Event()
-    async def linked(course):
+    async def linked(course, **kwargs):
         started.set()
         await asyncio.Event().wait()
     service.scan_linked_files = linked

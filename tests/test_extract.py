@@ -64,3 +64,20 @@ def test_search_only_returns_latest_available_versions(tmp_path):
     assert store.items(category='lab')['total'] == 1
     store.reconcile('1','content',[])
     assert not store.search_documents('new')['matches']
+
+
+def test_search_coverage_matches_course_filter_and_empty_results(tmp_path):
+    store = Store(tmp_path / 'db')
+    for course in ('1', '2'):
+        item = {'id': f'{course}:content:1', 'course_id': course, 'kind': 'content', 'title': 'Instructions'}
+        store.reconcile(course, 'content', [item])
+        file = tmp_path / f'temp{course}'
+        file.write_text('instructions')
+        version, _ = store.record_file(item, file, tmp_path / f'saved{course}', course, 12)
+        if course == '1':
+            store.save_document(version['id'], {'status': 'ok', 'text': 'instructions'})
+    assert store.search_documents('instructions')['index_coverage'] == {'total': 2, 'processed': 1}
+    assert store.search_documents('instructions', course_id='1')['index_coverage'] == {'total': 1, 'processed': 1}
+    assert store.search_documents('instructions', course_id='2')['index_coverage'] == {'total': 1, 'processed': 0}
+    assert store.search_documents('instructions', course_id='3')['index_coverage'] == {'total': 0, 'processed': 0}
+    store.close()

@@ -30,7 +30,8 @@ def main():
     sync.add_argument('--course', default=None)
     sub.add_parser('login', help='Sign in once before starting the service')
     sub.add_parser('status', help='Read service health')
-    sub.add_parser('check', help='Queue a fresh scan')
+    check = sub.add_parser('check', help='Queue a fresh scan')
+    check.add_argument('--verify-files', action='store_true', help='Recheck every downloadable file, including unchanged metadata')
     fetch = sub.add_parser('fetch', help='Download an item from the server to this machine')
     fetch.add_argument('item_id')
     fetch.add_argument('--output', type=Path, required=True)
@@ -105,7 +106,8 @@ def main():
     with httpx.Client(headers={'Authorization': 'Bearer ' + token}, timeout=180, trust_env=False) as client:
         if args.command in ('status', 'check', 'courses'):
             operation = {'status': 'status', 'check': 'scan', 'courses': 'courses'}[args.command]
-            response = client.post(base + '/api/' + operation, json={})
+            arguments = {'verify_files': args.verify_files} if args.command == 'check' else {}
+            response = client.post(base + '/api/' + operation, json=arguments)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
         else:

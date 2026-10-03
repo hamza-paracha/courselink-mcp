@@ -162,3 +162,68 @@ async def test_rate_limit_cancels_remaining_batch_work(download_service):
         await service.download_rows('1', rows, {'files_saved': 0, 'errors': []})
     assert calls <= 3 and service.active_downloads == 0
     assert not list(service.config.school.rglob('*.partial'))
+
+
+async def test_broken_link_does_not_starve_other_files_or_hide_previous_links(download_service):
+    service, row, mock = download_service
+    parent = dict(row, download_path=None, instructions={'Html':
+        '<a href="/content/broken.pdf">Broken</a><a href="/content/good.x68">Starter</a>'})
+    service.store.reconcile('1', 'content', [parent])
+    old = {'id': '1:linked_file:old', 'course_id': '1', 'kind': 'linked_file', 'title': 'Keep cached'}
+    service.store.upsert_link(old)
+    broken = True
+    def handler(request):
+        if broken and request.url.path.endswith('broken.pdf'):
+            return httpx.Response(500)
+        return httpx.Response(200, content=b'MOVE D0,D1', headers={'content-type': 'text/plain'})
+    mock(handler)
+    count, saved, errors = await service.scan_linked_files('1')
+    assert count == 2 and saved == 1 and len(errors) == 1
+    assert service.store.get(old['id'])['available']
+    good = next(r for r in service.store.items(kind='linked_file')['items'] if r.get('filename') == 'good.x68')
+    assert service.store.versions(good['id'])
+    broken = False
+    count, saved, errors = await service.scan_linked_files('1')
+    assert count == 2 and saved == 1 and not errors
+    assert not service.store.get(old['id'])['available']
+
+
+async def test_thorough_check_finds_byte_changes_before_periodic_recheck(download_service):
+    service, row, mock = download_service
+    data = b'%PDF-original'
+    calls = 0
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=data, headers={'content-type': 'application/pdf'})
+    mock(handler)
+    await service.download(row['id'])
+    data = b'%PDF-replaced-without-metadata-change'
+    report = {'files_saved': 0, 'errors': []}
+    await service.download_rows('1', [row], report)
+    assert calls == 1 and not report['files_saved']
+    await service.download_rows('1', [row], report, verify_files=True)
+    assert calls == 2 and report['files_saved'] == 1
+    assert len(service.store.versions(row['id'])) == 2
+
+
+async def test_full_scan_reports_link_failure_without_losing_successful_files(download_service):
+    service, row, mock = download_service
+    parent = dict(row, download_path=None, instructions={'Html':
+        '<a href="/content/unavailable.pdf">Missing</a><a href="/content/available.pdf">Available</a>'})
+    async def courses(): return [{'id': '1'}]
+    async def content(course): return [parent]
+    async def empty(course): return []
+    service.catalog.courses = courses
+    service.catalog.content = content
+    for name in ('assignments', 'announcements', 'calendar', 'quizzes'):
+        setattr(service.catalog, name, empty)
+    def handler(request):
+        return httpx.Response(404 if request.url.path.endswith('/unavailable.pdf') else 200,
+                              content=b'%PDF-synthetic', headers={'content-type': 'application/pdf'})
+    mock(handler)
+    report = await service.scan(verify_files=True)
+    assert not report['complete'] and report['verify_files']
+    assert report['duration_seconds'] >= 0 and report['files_saved'] == 1
+    assert len(report['errors']) == 1 and report['errors'][0]['section'] == 'linked_file'
+    assert report['courses']['1']['linked_file'] == 2

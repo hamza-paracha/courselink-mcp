@@ -33,7 +33,12 @@ def linked_files(parent, html, browser):
         parsed = urlsplit(url)
         if not parsed.path.startswith(('/content/', '/shared/')):
             continue
-        if not re.search(r'\.(pdf|docx?|pptx?|xlsx?|csv|txt|md|zip|gz|tar|java|py|c|h|cpp|html?)$', parsed.path, re.I):
+        decoded = unquote(parsed.path)
+        if '\\' in decoded or any(part in ('.', '..') for part in decoded.split('/')):
+            continue
+        # Course attachments can have arbitrary extensions or no extension at all.
+        # Keep the host/path boundary, rather than silently dropping unfamiliar files.
+        if not parsed.path.rsplit('/', 1)[-1]:
             continue
         try:
             url = browser.url(url.split('#', 1)[0])
@@ -111,7 +116,7 @@ class Catalog:
                     details = await self.browser.get(self.browser.api('le', f'{course}/content/topics/{identifier}'))
                     source = topic.get('Url', '')
                     # Only file-backed course topics; links to other activities stay as metadata.
-                    file_backed = urlsplit(source).path.startswith('/content/')
+                    file_backed = urlsplit(source).path.startswith(('/content/', '/shared/'))
                     results.append(item(course, 'content', identifier, topic['Title'],
                         category=category(topic['Title'], path), module=path,
                         url=self.browser.url(f'/d2l/le/content/{course}/viewContent/{identifier}/View'),
@@ -174,6 +179,7 @@ class Catalog:
         rows = await self.browser.paged(self.browser.api('le', f'{course}/calendar/events/'))
         return [item(course, 'event', row['CalendarEventId'], row['Title'],
                      description=richtext(row.get('Description')),
+                     instructions=row.get('Description'),
                      start_date=row.get('StartDateTime') or row.get('StartDay'),
                      end_date=row.get('EndDateTime') or row.get('EndDay'),
                      due_date=row.get('StartDateTime') if row.get('EventType') == 6 else None,
@@ -185,5 +191,6 @@ class Catalog:
         return [item(course, 'quiz', row['QuizId'], row['Name'],
                      due_date=row.get('DueDate'), start_date=row.get('StartDate'),
                      end_date=row.get('EndDate'), description=richtext(row.get('Description')),
+                     instructions=row.get('Description'),
                      url=self.browser.url(f'/d2l/lms/quizzing/quizzes.d2l?ou={course}'),
                      download_path=None) for row in rows if not row.get('IsHidden')]

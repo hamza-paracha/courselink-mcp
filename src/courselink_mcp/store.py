@@ -175,10 +175,15 @@ class Store:
             position = text.lower().find(query.lower())
             results.append({k: row[k] for k in ('id', 'title', 'course_id', 'version_id')} |
                            {'snippet': text[max(position-150, 0):position+450]})
-        coverage = self.db.execute('''SELECT count(*) AS total,
-            sum(CASE WHEN d.version_id IS NOT NULL THEN 1 ELSE 0 END) AS processed
+        coverage_sql = '''SELECT count(*) AS total,
+            coalesce(sum(CASE WHEN d.version_id IS NOT NULL THEN 1 ELSE 0 END),0) AS processed
             FROM versions v JOIN items i ON i.id=v.item_id LEFT JOIN documents d ON d.version_id=v.id
-            WHERE i.available=1 AND v.id=(SELECT max(id) FROM versions WHERE item_id=i.id)''').fetchone()
+            WHERE i.available=1 AND v.id=(SELECT max(id) FROM versions WHERE item_id=i.id)'''
+        coverage_params = []
+        if course_id:
+            coverage_sql += ' AND i.course_id=?'
+            coverage_params.append(course_id)
+        coverage = self.db.execute(coverage_sql, coverage_params).fetchone()
         return {'matches': results, 'limit': min(max(limit, 1), 100), 'index_coverage': dict(coverage),
                 'note': 'Search covers extracted text only; inspect read_document warnings and original files for images/unsupported formats.'}
 
