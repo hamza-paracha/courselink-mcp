@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
@@ -39,6 +40,16 @@ def register_tools(mcp, call):
     async def list_courses() -> dict:
         """List discovered courses, IDs, and which ones are monitored. Results are cached."""
         return await call('courses', {})
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+    async def get_grades(course_id: str | None = None) -> dict:
+        """Read your grades for one or all monitored courses (ID or folder abbreviation).
+
+        Uses the running browser session and an on-demand cache. Report each course's
+        freshness and coverage errors. Unknown/unreleased grades are not zero, and
+        final grades are shown only when available. Feedback text is omitted.
+        """
+        return await call('grades', {'course_id': course_id})
 
     @mcp.tool()
     async def list_items(course_id: str | None = None, kind: str | None = None,
@@ -181,6 +192,8 @@ class API:
             return service.health()
         if operation == 'courses':
             return {'courses': store.courses(), 'last_scan': store.get_state('last_scan'), 'freshness': service.freshness()}
+        if operation == 'grades':
+            return await service.get_grades(**args)
         if operation == 'items':
             return {**store.items(**args), 'freshness': service.freshness()}
         if operation == 'materials':
@@ -296,9 +309,13 @@ def create_app(config, service=None):
         try:
             operation = request.path_params['operation']
             if request.method == 'GET':
-                if operation not in {'status', 'health', 'courses', 'items', 'item', 'changes', 'versions', 'materials', 'search_documents'}:
+                if operation not in {'status', 'health', 'courses', 'items', 'item', 'changes', 'versions', 'materials', 'search_documents', 'grades'}:
                     return JSONResponse({'error': 'Use POST for this operation.'}, 405)
                 args = dict(request.query_params)
+                if operation == 'grades' and 'refresh' in args:
+                    if args['refresh'] not in ('true', 'false'):
+                        raise ValueError('refresh must be true or false.')
+                    args['refresh'] = args['refresh'] == 'true'
                 for key in ('limit', 'offset', 'after'):
                     if key in args:
                         args[key] = int(args[key])

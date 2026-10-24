@@ -22,6 +22,10 @@ def main():
     bridge.add_argument('--start-service', action='store_true', help='Start the local monitor if needed')
     sub.add_parser('start', help='Start the local monitor in the background if needed')
     sub.add_parser('courses', help='List discovered courses and IDs')
+    grades = sub.add_parser('grades', help='Read grades through the running service; never starts it')
+    grades.add_argument('--course', default=None, help='Monitored course ID or folder abbreviation')
+    grades.add_argument('--json', action='store_true', help='Print the complete structured result')
+    grades.add_argument('--refresh', action='store_true', help='Bypass the grades cache using the existing session')
     configure = sub.add_parser('configure', help='Add course mappings without editing JSON')
     configure.add_argument('--course', action='append', required=True, metavar='ID=FOLDER')
     sub.add_parser('mcp-config', help='Print a ready-to-use private MCP client entry')
@@ -104,7 +108,31 @@ def main():
     base = os.environ.get('COURSELINK_SERVER_URL', f'http://127.0.0.1:{config.port}').rstrip('/')
     token = os.environ.get('COURSELINK_SERVER_TOKEN') or config.token()
     with httpx.Client(headers={'Authorization': 'Bearer ' + token}, timeout=180, trust_env=False) as client:
-        if args.command in ('status', 'check', 'courses'):
+        if args.command == 'grades':
+            params = {'refresh': str(args.refresh).lower()}
+            if args.course is not None:
+                params['course_id'] = args.course
+            response = client.get(base + '/api/grades', params=params)
+            response.raise_for_status()
+            result = response.json()
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                for course in result['courses']:
+                    print(f"{course['folder']} ({course['course_id']}) — checked {course['checked_at'] or 'never'}")
+                    for item in course['items']:
+                        print(f"  {item['name']}: {item['display'] or 'unreleased/unknown'} "
+                              f"(points {item['points_earned']}/{item['points_max']}; "
+                              f"weight {item['weight_achieved']}/{item['weight_max']})")
+                    final = course['final_calculated_grade']
+                    print('  Final calculated grade: ' + (final['display'] or str(final['percent']) if final else 'unreleased/unknown'))
+                    for error in course['coverage']['errors']:
+                        print(f"  Coverage: {error['section']}: {error['message']}")
+                    for warning in course['coverage']['warnings']:
+                        print('  Coverage: ' + warning)
+            if not result['coverage']['complete']:
+                sys.exit(1)
+        elif args.command in ('status', 'check', 'courses'):
             operation = {'status': 'status', 'check': 'scan', 'courses': 'courses'}[args.command]
             arguments = {'verify_files': args.verify_files, 'force_refresh': True} if args.command == 'check' else {}
             response = client.post(base + '/api/' + operation, json=arguments)

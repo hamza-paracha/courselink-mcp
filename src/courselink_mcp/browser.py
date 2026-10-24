@@ -18,7 +18,9 @@ class LoginRequired(RuntimeError):
 
 
 class EndpointUnavailable(RuntimeError):
-    pass
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class RateLimited(RuntimeError):
@@ -141,7 +143,7 @@ class BrowserSession:
             cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'], path=cookie['path'])
         return cookies
 
-    async def get(self, path, params=None):
+    async def get(self, path, params=None, *, response_type='json'):
         # Use browser requests so refreshed session cookies are retained by Chromium.
         url = self.url(path)
         if self.closed or not self.context:
@@ -168,7 +170,7 @@ class BrowserSession:
                 response = None
                 try:
                     response = await context.request.get(url, params=params,
-                        timeout=30000, max_redirects=0, headers={'Accept': 'application/json'})
+                        timeout=30000, max_redirects=0, headers={'Accept': 'text/html' if response_type == 'html' else 'application/json'})
                     status = response.status
                     if status == 429:
                         self.rate_limit(response.headers.get('retry-after', '5'))
@@ -177,9 +179,17 @@ class BrowserSession:
                     elif status in (301, 302, 303, 307, 308, 401):
                         raise LoginRequired('CourseLink requires sign-in in the dedicated browser.')
                     elif status in (403, 404):
-                        raise EndpointUnavailable(f'CourseLink endpoint returned {status}: {urlsplit(url).path}')
+                        raise EndpointUnavailable(f'CourseLink endpoint returned {status}: {urlsplit(url).path}', status_code=status)
                     elif status >= 400:
                         raise RuntimeError(f'CourseLink returned HTTP {status}.')
+                    elif response_type == 'html' and 'text/html' in response.headers.get('content-type', '').lower():
+                        data = await response.text()
+                        if re.search(r'<input\b[^>]*\btype\s*=\s*[\"\']?password\b|'
+                                     r'<form\b[^>]*\baction\s*=\s*[\"\']?[^>\s]*'
+                                     r'/d2l/(?:login|lms/authenticate)', data, re.I):
+                            raise LoginRequired('CourseLink requires sign-in in the dedicated browser.')
+                        self.count('successes')
+                        return data
                     elif 'json' not in response.headers.get('content-type', '').lower():
                         raise LoginRequired('CourseLink returned a sign-in page instead of data.')
                     else:

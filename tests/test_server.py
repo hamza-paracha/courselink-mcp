@@ -160,7 +160,7 @@ async def test_check_now_defaults_to_cache_even_for_legacy_clients(setup, argume
     _, service = setup
     registered = {}
     class Registry:
-        def tool(self):
+        def tool(self, **kwargs):
             def register(fn):
                 registered[fn.__name__] = fn
                 return fn

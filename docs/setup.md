@@ -64,6 +64,7 @@ Try asking your client to check for new assignments, find a lab's instructions, 
 | --- | --- |
 | `courselink_status` | Authentication, freshness, scan errors, and index coverage |
 | `list_courses` | Discover accessible courses and monitored folder mappings |
+| `get_grades` | Read grades for one or all monitored courses with per-course freshness and coverage |
 | `list_items` | Search and paginate content, assignments, announcements, events, quizzes, and linked files |
 | `list_materials` | Find labs or assignments across indexed sources |
 | `get_item` | Instructions, dates, availability, and original URL |
@@ -77,6 +78,27 @@ Try asking your client to check for new assignments, find a lab's instructions, 
 | `open_login` | Open the local browser or explain remote session renewal |
 
 `read_document` reuses saved files by default. It downloads missing files. Saved copies return immediately; when metadata changes or a file recheck is due, it queues a background scan. Check `refresh_queued` and `source_checked_at` before claiming the latest contents. Set `refresh=True` to force an immediate remote check, or `refresh=False` to require a saved copy. Cached reads also work while signed out. The response reports whether it freshly checked the file or queued a refresh. If you need current bytes before answering, explicitly request `refresh=True`. Labels are inferred from titles and module paths; use `list_items` and full-text search when a lab or assignment is not grouped as expected. Text extraction has time, memory, and size limits. Inspect the original file for scanned pages, diagrams, layout-sensitive tables, unsupported formats, or truncated text. ZIP contents are read without executing or extracting them onto disk.
+
+### Grades (read-only)
+
+`get_grades(course_id: string | null = null)` accepts a monitored course ID or folder abbreviation; omitting it selects all monitored courses. It uses the running service's authenticated browser requests and discovered LE API version. It fetches on demand and caches normalized snapshots in the private SQLite store for `poll_seconds`; background material scans and `check_now` do not refresh grades. Cached results remain readable while signed out. A failed or partial refresh retains an existing snapshot and `checked_at`, with new coverage errors and `last_attempt_at`; a first partial fetch can still return usable values. A restored authenticated session retries immediately after an offline attempt. Concurrent reads share the grades cache lock.
+
+The response has `courses`, overall `coverage.complete`, and a `note`. Each course includes `course_id`, `folder`, `items`, `categories`, `final_calculated_grade`, `source` (`api` or `html`), `no_grades_released`, `checked_at`, `last_attempt_at`, `freshness`, and `coverage` (`complete`, `errors`, `warnings`). Freshness includes the snapshot's age, refresh interval, refresh-due flag, and session state; it is independent of material scan freshness. Coverage errors distinguish missing category/object metadata and inaccessible final grades from successful empty results. `no_grades_released` is null when coverage cannot establish that result.
+
+Items include `id`, `name`, `grade_object_type` (the API type number, or null for HTML/unknown), `category`, `category_id`, `is_category`, `points_earned`, `points_max`, `weight_achieved`, `weight_max`, `configured_weight`, `percent`, `letter`, `display`, `feedback_present`, `last_modified`, and `flags` (`dropped`, `excluded`, `bonus`, `can_exceed_max_points`, `hidden_or_unreleased`). Null values and flags mean unknown; ungraded points are never converted to zero. API weights achieved/max come from the grade value itself; `configured_weight` is the object's configured weight, which can be relative to its category. Category metadata includes weights, maximum points, exclusion and drop-count settings. Drop counts do not identify which individual items were dropped, so no dropped status is inferred from them or from a zero weight. Feedback bodies and private comments are neither returned nor stored. No final grade is estimated by summing items.
+
+The learner API endpoints are GET-only: `grades/values/myGradeValues/`, `grades/final/values/myGradeValue`, `grades/`, and `grades/categories/`, under `/d2l/api/le/<discovered-version>/<course>/`. The final endpoint supplies the final calculated grade when released; null/unreleased results stay null. A final HTTP 404 is reported as unavailable in coverage warnings. Other 403/404 metadata responses produce partial coverage. The field mappings follow the [Brightspace grades API reference](https://docs.valence.desire2learn.com/res/grade.html).
+
+When the grade-values API returns 403 or 404, the service tries GET `/d2l/lms/grades/my_grades/main.d2l?ou=<course>`. The fallback recognizes English learner grade tables and explicit empty-grade messages; it reports visible rows and marks unavailable metadata as null. HTML coverage carries a warning about this limitation. Columns are matched by header name; nested feedback tables and hidden rows are excluded. Ambiguous row layouts and header-only pages fail closed. Changed/unrecognized pages, forbidden HTML, login redirects, and rate limits leave earlier cached grades intact and report errors. Transport exception bodies are omitted from coverage messages to avoid retaining feedback or credentials. No hidden grades are discovered through additional requests.
+
+To test against an existing service/session without starting it or opening sign-in:
+
+```sh
+uv run courselink grades --json
+uv run courselink grades --course example-course --refresh --json
+```
+
+`--refresh` bypasses the grades cache. Without `--json`, the CLI prints a compact grade summary and coverage messages. It exits nonzero for incomplete coverage. These commands use the configured local/remote service and bearer authentication; they never own or open the browser profile themselves.
 
 ## Use CourseLink in Claude chat
 
@@ -171,6 +193,7 @@ The service also provides MCP Streamable HTTP at `/mcp/` and REST endpoints unde
 | `/api/status` | GET | None |
 | `/api/health` | GET | Worker health only; requires the same bearer token |
 | `/api/courses` | GET | None |
+| `/api/grades` | GET | Optional `course_id` (monitored ID/folder), `refresh=true` to bypass the grades cache; normalized grades, per-course freshness and coverage |
 | `/api/items` | GET | `course_id`, `kind`, `query`, `limit`, `offset` |
 | `/api/materials` | GET | `course_id`, `material_type`, `limit`, `offset` |
 | `/api/document` | POST | `item_id`, optional `archive_member`, `offset`, `length`, `refresh` |
@@ -193,7 +216,7 @@ uv sync --locked
 uv run pytest -q
 ```
 
-Tests use synthetic courses and mocked requests; no live account is needed. They cover change tracking, pagination, revision retention, download limits, path safety, login response rejection, request authentication, document extraction, and partial scan failures.
+Tests use synthetic courses and mocked requests; no live account is needed. They cover change tracking, pagination, revision retention, download limits, path safety, login response rejection, request authentication, document extraction, partial scan failures, and synthetic API/HTML grades, cache freshness, partial coverage, and read-only grades CLI requests.
 
 Released under the [MIT License](../LICENSE).
 

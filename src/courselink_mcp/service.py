@@ -18,6 +18,7 @@ import httpx
 from .browser import BrowserSession, LoginRequired, RateLimited
 from .catalog import Catalog, linked_files
 from .store import Store, now, safe_name
+from .grades import fetch_grades, grade_error, has_grade
 from .extract import EXTRACTOR_VERSION
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ class Service:
         self.browser = BrowserSession(config)
         self.catalog = Catalog(self.browser)
         self.scan_lock = asyncio.Lock()
+        self.grades_lock = asyncio.Lock()
         self.download_locks = WeakValueDictionary()
         self.download_slots = asyncio.Semaphore(config.download_concurrency)
         self.active_downloads = 0
@@ -64,6 +66,60 @@ class Service:
                 'refresh_interval_seconds': self.config.poll_seconds,
                 'refresh_due': age is None or age >= self.config.poll_seconds or not latest.get('complete'),
                 'scanning': self.scan_lock.locked(), 'session_state': self.browser.status['state']}
+
+    async def get_grades(self, course_id=None, refresh=False):
+        if type(refresh) is not bool:
+            raise ValueError('refresh must be true or false.')
+        if course_id is not None and course_id not in self.config.courses:
+            raise ValueError('Grades are available only for monitored courses.')
+        selected = [course_id] if course_id is not None else list(self.config.courses)
+        results = []
+        async with self.grades_lock:
+            for course in selected:
+                cached = self.store.grades(course) or {}
+                attempt = cached.get('last_attempt_at')
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(attempt)).total_seconds() if attempt else None
+                session_state = self.browser.status.get('state')
+                recovered = (cached.get('attempt_session_state') not in (None, 'authenticated')
+                             and session_state == 'authenticated')
+                if refresh or recovered or age is None or age >= self.config.poll_seconds:
+                    stamp = now()
+                    try:
+                        if self.browser.status.get('state') != 'authenticated':
+                            raise LoginRequired('Sign in through the existing service to refresh grades.')
+                        if not self.browser.versions.get('le'):
+                            await self.browser.discover_versions()
+                        snapshot = await fetch_grades(self.browser, course)
+                        if not snapshot['coverage']['complete'] and cached.get('checked_at'):
+                            cached = {**cached, 'coverage': snapshot['coverage'], 'last_attempt_at': stamp}
+                        else:
+                            cached = {**snapshot, 'checked_at': now(), 'last_attempt_at': stamp}
+                    except Exception as exc:
+                        # Preserve the last grade values and their original timestamp on failure.
+                        cached = {**cached, 'last_attempt_at': stamp,
+                                  'coverage': {'complete': False,
+                                      'errors': [{'section': 'grades', 'message': grade_error(exc)}],
+                                      'warnings': []}}
+                    cached['attempt_session_state'] = session_state
+                    self.store.save_grades(course, cached)
+                checked = cached.get('checked_at')
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(checked)).total_seconds() if checked else None
+                coverage = cached.get('coverage', {'complete': False, 'errors': [], 'warnings': []})
+                results.append({'course_id': course, 'folder': self.config.courses[course],
+                    'items': cached.get('items', []), 'categories': cached.get('categories', []),
+                    'final_calculated_grade': cached.get('final_calculated_grade'),
+                    'source': cached.get('source'), 'checked_at': checked,
+                    'last_attempt_at': cached.get('last_attempt_at'), 'coverage': coverage,
+                    'no_grades_released': (not any(has_grade(row) for row in cached.get('items', []))
+                        and cached.get('final_calculated_grade') is None
+                        if checked and coverage['complete'] else None),
+                    'freshness': {'checked_at': checked, 'age_seconds': round(max(0, age), 1) if age is not None else None,
+                        'refresh_interval_seconds': self.config.poll_seconds,
+                        'refresh_due': age is None or age >= self.config.poll_seconds or not coverage['complete'],
+                        'session_state': self.browser.status['state']}})
+        return {'courses': results, 'coverage': {'complete': all(c['coverage']['complete'] for c in results)},
+                'note': 'Read-only grades, cached on demand. Null fields/flags mean unknown. '
+                        'Missing or unreleased grades are never treated as zero; no final grade is estimated.'}
 
     async def start(self):
         self.heartbeats = {name: time.monotonic() for name in ('session', 'scan', 'index')}

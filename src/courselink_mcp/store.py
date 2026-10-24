@@ -58,6 +58,12 @@ class Store:
         row = self.db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
         return json.loads(row[0]) if row else default
 
+    def grades(self, course_id):
+        return self.get_state('grades:' + str(course_id))
+
+    def save_grades(self, course_id, snapshot):
+        self.set_state('grades:' + str(course_id), snapshot)
+
     def save_courses(self, courses):
         with self.db:
             for course in courses:
