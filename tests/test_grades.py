@@ -519,3 +519,92 @@ async def test_html_login_detection_does_not_reject_logout_links(tmp_path, body,
             await browser.get('/grades', response_type='html')
     else:
         assert await browser.get('/grades', response_type='html') == body
+
+
+@pytest.mark.parametrize('release', [
+    {'IsReleased': False}, {'IsHidden': True}, {'ReleasedDate': None},
+    {'ReleasedDate': ''}, {'DisplayedGrade': 'Not released'},
+])
+async def test_unreleased_scores_are_not_returned_or_cached(service, release):
+    service.browser.data['values'][0].update(release)
+    row = (await service.get_grades('123'))['courses'][0]['items'][0]
+    assert row['flags']['hidden_or_unreleased'] is True
+    for key in ('points_earned', 'weight_achieved', 'percent', 'display', 'letter'):
+        assert row[key] is None
+        assert service.store.grades('123')['items'][0][key] is None
+    assert row['points_max'] == 10 and row['weight_max'] == 5
+
+
+def test_hidden_definition_suppresses_value():
+    row = normalize({'PointsNumerator': 8, 'DisplayedGrade': 'A'}, {'IsHidden': True})
+    assert row['points_earned'] is None and row['letter'] is None
+
+
+@pytest.mark.parametrize('denominator', [None, ''])
+def test_missing_denominator_uses_definition(denominator):
+    row = normalize({'PointsNumerator': 8, 'PointsDenominator': denominator}, {'MaxPoints': 10})
+    assert row['points_max'] == 10 and row['percent'] == 80
+    assert normalize({'PointsNumerator': 1, 'PointsDenominator': 0}, {'MaxPoints': 10})['percent'] is None
+
+
+@pytest.mark.parametrize('score,percent', [('4 / 5', 80), ('0 / 5', 0), ('– / 5', None)])
+def test_weighted_only_html(score, percent):
+    row = parse_html('<table><tr><th>Grade Item</th><th>Weight Achieved</th></tr>'
+                     f'<tr><th>Quiz</th><td>{score}</td></tr></table>')['items'][0]
+    assert row['percent'] == percent
+    assert row['points_earned'] is None and row['weight_max'] == 5
+
+
+def test_html_unreleased_score_is_suppressed():
+    row = parse_html('<table><tr><th>Grade Item</th><th>Points</th><th>Grade</th></tr>'
+                     '<tr><th>Quiz</th><td>8 / 10</td><td>Not released</td></tr></table>')['items'][0]
+    assert row['points_earned'] is None and row['percent'] is None and row['display'] is None
+
+
+async def test_null_embedded_grade_definitions_do_not_discard_values():
+    browser = GradeBrowser()
+    browser.data['categories'][0]['Grades'] = None
+    result = await fetch_grades(browser, '123')
+    assert result['coverage']['complete'] and result['items'][0]['points_earned'] == 8
+
+
+@pytest.mark.parametrize('kind', ['builtin', 'playwright'])
+async def test_timeout_is_clear_and_does_not_leak_secrets(service, kind, caplog):
+    from playwright.async_api import TimeoutError as BrowserTimeoutError
+    error = TimeoutError if kind == 'builtin' else BrowserTimeoutError
+    service.browser.failures['values'] = error('SYNTHETIC-SECRET-cookie')
+    result = await service.get_grades('123')
+    assert 'timed out' in result['courses'][0]['coverage']['errors'][0]['message']
+    assert 'SYNTHETIC-SECRET' not in json.dumps(result) + json.dumps(service.store.grades('123')) + caplog.text
+
+
+@pytest.mark.parametrize('status,error', [(401, LoginRequired), (403, EndpointUnavailable)])
+async def test_grade_api_http_errors_use_get_and_dispose(tmp_path, status, error):
+    browser = BrowserSession(Config(state=tmp_path, school=tmp_path))
+    calls, disposed = [], []
+    async def dispose():
+        disposed.append(True)
+    async def get(url, **kwargs):
+        calls.append(url)
+        return SimpleNamespace(status=status, headers={}, dispose=dispose)
+    browser.context = SimpleNamespace(request=SimpleNamespace(get=get))
+    browser.closed = False
+    with pytest.raises(error):
+        await browser.get('/d2l/api/le/1.99/123/grades/values/myGradeValues/')
+    assert len(calls) == 1 and disposed == [True]
+
+
+@pytest.mark.parametrize('paging', [
+    {'PagingInfo': {'HasMoreItems': True, 'Bookmark': 'same'}},
+    {'Next': '/d2l/api/le/1.99/123/grades/?page=same'},
+])
+async def test_grade_pagination_repetition_fails_closed(tmp_path, paging):
+    browser = BrowserSession(Config(state=tmp_path, school=tmp_path))
+    calls = []
+    async def get(path, params=None):
+        calls.append(path)
+        return {'Items': [], **paging}
+    browser.get = get
+    with pytest.raises(ValueError, match='repeated'):
+        await browser.paged('/d2l/api/le/1.99/123/grades/')
+    assert len(calls) == 2

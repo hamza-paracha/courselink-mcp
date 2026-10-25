@@ -3,6 +3,8 @@ from html.parser import HTMLParser
 import math
 import re
 
+from playwright.async_api import TimeoutError as BrowserTimeoutError
+
 from .browser import EndpointUnavailable, LoginRequired, RateLimited
 from .catalog import richtext
 
@@ -14,6 +16,8 @@ def grade_error(exc):
         return 'Sign in through the existing service to refresh grades.'
     if isinstance(exc, RateLimited):
         return 'CourseLink rate limited the grades request; retry later.'
+    if isinstance(exc, (TimeoutError, BrowserTimeoutError)):
+        return 'CourseLink grades request timed out; retry later.'
     if isinstance(exc, EndpointUnavailable) and exc.status_code in (403, 404):
         return f'CourseLink grades endpoint returned HTTP {exc.status_code}.'
     return 'Grades request failed or returned an unrecognized response.'
@@ -39,14 +43,23 @@ def has_grade(row):
         or (row['display'] or '').strip().lower() not in ('', '-', '–', 'not released', 'unreleased'))
 
 
+def hide_unreleased(row):
+    if row['flags']['hidden_or_unreleased'] is True:
+        for key in ('points_earned', 'weight_achieved', 'percent', 'display', 'letter'):
+            row[key] = None
+    return row
+
+
 def normalize(value, obj=None, category=None):
     obj, category = obj or {}, category or {}
     earned = number(value.get('PointsNumerator'))
-    maximum = number(value.get('PointsDenominator', obj.get('MaxPoints')))
+    maximum = number(value.get('PointsDenominator'))
+    if maximum is None:
+        maximum = number(obj.get('MaxPoints'))
     weighted = number(value.get('WeightedNumerator'))
     weight_max = number(value.get('WeightedDenominator'))
     percent = earned / maximum * 100 if earned is not None and maximum else None
-    display = richtext(value.get('DisplayedGrade')) or None
+    display = richtext(value.get('DisplayedGrade')).strip() or None
     if percent is None and weighted is not None and weight_max:
         percent = weighted / weight_max * 100
     if percent is None and display:
@@ -59,10 +72,11 @@ def normalize(value, obj=None, category=None):
         excluded = True
     hidden = flag(value, 'IsHidden')
     if (obj.get('IsHidden') is True or value.get('IsReleased') is False
+            or ('ReleasedDate' in value and not value['ReleasedDate'])
             or (display or '').lower() in ('not released', 'unreleased')
             or (earned is None and weighted is None and display in (None, '-', '–'))):
         hidden = True
-    return {
+    return hide_unreleased({
         'id': str(value.get('GradeObjectIdentifier', obj.get('Id', ''))) or None,
         'name': value.get('GradeObjectName') or obj.get('Name') or 'Grade',
         'grade_object_type': value.get('GradeObjectType'),
@@ -77,7 +91,7 @@ def normalize(value, obj=None, category=None):
                   'bonus': flag(value, 'IsBonus') if flag(value, 'IsBonus') is not None else flag(obj, 'IsBonus'),
                   'can_exceed_max_points': flag(obj, 'CanExceedMaxPoints'),
                   'hidden_or_unreleased': hidden},
-    }
+    })
 
 
 class GradeTable(HTMLParser):
@@ -214,6 +228,8 @@ def parse_html(html):
         row['percent'] = number(match[1]) if match else (
             row['points_earned'] / row['points_max'] * 100
             if row['points_earned'] is not None and row['points_max'] else None)
+        if row['percent'] is None and row['weight_achieved'] is not None and row['weight_max']:
+            row['percent'] = row['weight_achieved'] / row['weight_max'] * 100
         feedback = ' '.join(v for k, v in values.items() if 'feedback' in k or 'comments' in k).lower()
         row['feedback_present'] = bool(feedback and feedback not in ('-', '–', 'no feedback', ''))
         # Never inspect feedback text for status flags or include it in results.
@@ -232,6 +248,7 @@ def parse_html(html):
                 or (row['points_earned'] is None and row['weight_achieved'] is None
                     and row['display'] in (None, '-', '–'))):
             row['flags']['hidden_or_unreleased'] = True
+        hide_unreleased(row)
         if is_category:
             categories.append({'id': None, 'name': name, 'weight': row['weight_max'],
                 'points_max': row['points_max'], 'excluded': row['flags']['excluded'],
@@ -277,7 +294,7 @@ async def fetch_grades(browser, course):
     by_id = {str(o['Id']): o for o in objects}
     by_category = {str(c['Id']): c for c in categories}
     for cat in categories:
-        for obj in cat.get('Grades', []):
+        for obj in cat.get('Grades') or []:
             by_id.setdefault(str(obj['Id']), {**obj, 'CategoryId': cat['Id']})
     items = []
     seen = set()
