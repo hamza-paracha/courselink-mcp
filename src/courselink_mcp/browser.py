@@ -8,7 +8,6 @@ from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlsplit
 
-import httpx
 
 from .store import now
 
@@ -136,6 +135,7 @@ class BrowserSession:
         return url
 
     async def cookies(self):
+        import httpx
         if not self.context:
             raise LoginRequired('Browser is not ready.')
         cookies = httpx.Cookies()
@@ -297,3 +297,49 @@ class BrowserSession:
                 self.status = {'state': 'login_required', 'last_verified': self.status.get('last_verified'),
                                'message': 'Complete sign-in/MFA in the dedicated CourseLink browser.'}
             return self.status
+
+    async def upload_dropbox(self, course, folder, files, *, preflight):
+        """One explicit UI submission in the existing profile; never retry a write.
+
+        UI handles Brightspace's session/CSRF and multipart staging protocol. Fail
+        closed when its controls change. Callers must enforce preview confirmation.
+        """
+        from .submissions import identifier, require_interactive_submission
+        from urllib.parse import parse_qs
+        require_interactive_submission()
+        identifier(course)
+        identifier(folder)
+        async with self.lock:
+            if self.closed or not self.context or self.status.get('state') != 'authenticated':
+                raise LoginRequired('Sign in before submitting.')
+            await self.wait_for_cooldown()
+            page = await self.context.new_page()
+            path = '/d2l/lms/dropbox/user/folder_submit_files.d2l'
+
+            def correct_page():
+                url = urlsplit(page.url)
+                params = parse_qs(url.query)
+                return (url.scheme == 'https' and url.netloc == urlsplit(self.config.base_url).netloc
+                        and url.path == path and params.get('ou') == [course] and params.get('db') == [folder])
+
+            try:
+                await page.goto(self.url(f'{path}?ou={course}&db={folder}'), wait_until='domcontentloaded')
+                if not correct_page():
+                    raise ValueError('Unexpected submission page; upload refused.')
+                inputs = page.locator('input[type="file"]')
+                submit = page.get_by_role('button', name='Submit', exact=True)
+                if await inputs.count() != 1 or await submit.count() != 1 or not await submit.is_enabled():
+                    raise ValueError('Unrecognized submission controls; upload refused.')
+                preflight()
+                await inputs.set_input_files(files)
+                if not correct_page():
+                    raise ValueError('Submission page changed; upload refused.')
+                preflight()
+                try:
+                    await submit.click()
+                    await page.get_by_text('File submission successful', exact=False).wait_for(timeout=10000)
+                except Exception:
+                    return {'outcome': 'unknown', 'message': 'Submission may have reached CourseLink. Check list_submissions before any new attempt.'}
+                return {'outcome': 'submitted', 'message': 'CourseLink displayed a submission success confirmation.'}
+            finally:
+                await page.close()

@@ -45,7 +45,7 @@ async def test_weighted_api_categories_and_released_final():
     lab, ungraded, text, bonus, category, hidden = result['items']
     assert lab['category'] == 'Labs' and lab['percent'] == 80
     assert (lab['weight_achieved'], lab['weight_max'], lab['configured_weight']) == (4, 5, 50)
-    assert lab['last_modified'] == '2026-10-20T12:00:00Z' and lab['feedback_present']
+    assert lab['last_modified'] == '2040-10-20T12:00:00Z' and lab['feedback_present']
     assert ungraded['points_earned'] is None and ungraded['percent'] is None
     assert text['display'] == 'Complete' and text['flags']['excluded']
     assert bonus['flags']['bonus'] and bonus['flags']['dropped'] and bonus['percent'] is None
@@ -608,3 +608,42 @@ async def test_grade_pagination_repetition_fails_closed(tmp_path, paging):
     with pytest.raises(ValueError, match='repeated'):
         await browser.paged('/d2l/api/le/1.99/123/grades/')
     assert len(calls) == 2
+
+
+async def test_adjusted_final_preserved_separately_in_api_and_html():
+    browser = GradeBrowser()
+    browser.data['final']['GradeObjectType'] = 8
+    browser.data['final']['GradeObjectName'] = 'Final Adjusted Grade'
+    result = await fetch_grades(browser, '123')
+    assert result['final_calculated_grade'] is None
+    assert result['final_adjusted_grade']['letter'] == 'A-'
+    html = (FIXTURES / 'learner.html').read_text().replace('Final Calculated Grade', 'Final Adjusted Grade')
+    result = parse_html(html)
+    assert result['final_calculated_grade'] is None and result['final_adjusted_grade']['percent'] == 80
+
+
+async def test_grade_metadata_requests_overlap_without_extra_fetches():
+    browser = GradeBrowser()
+    original = browser.get
+    entered = set()
+    release = asyncio.Event()
+    async def get(path, **kwargs):
+        if 'myGradeValues/' not in path:
+            entered.add(path)
+            if len(entered) == 3:
+                release.set()
+            await asyncio.wait_for(release.wait(), 1)
+        return await original(path, **kwargs)
+    browser.get = get
+    result = await fetch_grades(browser, '123')
+    assert result['coverage']['complete'] and len(browser.calls) == 4
+
+
+async def test_final_in_grade_values_is_not_lost_if_final_endpoint_unavailable():
+    browser = GradeBrowser()
+    browser.data['values'].append({'GradeObjectIdentifier': '999', 'GradeObjectName': 'Final Adjusted Grade',
+                                  'GradeObjectType': 8, 'DisplayedGrade': '90 %', 'IsReleased': True})
+    browser.failures['final'] = EndpointUnavailable('HTTP 404', 404)
+    result = await fetch_grades(browser, '123')
+    assert result['final_adjusted_grade']['percent'] == 90
+    assert all(r['id'] != '999' for r in result['items'])

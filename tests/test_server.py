@@ -5,6 +5,37 @@ from courselink_mcp.server import create_app, API
 from courselink_mcp.service import Service
 
 
+async def test_every_registered_tool_has_docstring_and_routing_instructions():
+    import inspect
+    import re
+    from mcp.server.fastmcp import FastMCP
+    from courselink_mcp.server import MCP_INSTRUCTIONS, register_tools
+
+    mcp = FastMCP('routing-test')
+    registered = {}
+
+    class Registry:
+        def tool(self, **kwargs):
+            def register(fn):
+                registered[fn.__name__] = fn
+                return mcp.tool(**kwargs)(fn)
+            return register
+
+    async def unused_call(operation, arguments):
+        raise AssertionError('Registration must not call CourseLink')
+
+    register_tools(Registry(), unused_call)
+    tools = await mcp.list_tools()
+    assert tools
+    # Every shared tool must also route through the optional computer bridge.
+    from courselink_mcp.computer import OPERATIONS
+    assert {tool.name for tool in tools} == set(OPERATIONS.values())
+    for tool in tools:
+        assert inspect.getdoc(registered[tool.name]), tool.name
+        assert tool.description and tool.description.strip(), tool.name
+        assert re.search(r'\b' + re.escape(tool.name) + r'\b', MCP_INSTRUCTIONS), tool.name
+
+
 @pytest.fixture
 def setup(tmp_path):
     config = Config(state=tmp_path, school=tmp_path, courses={'1': 'example-course'})
@@ -228,3 +259,94 @@ async def test_parent_failure_preserves_links_and_reports_stale_cache(setup):
     fresh = (await API(service).call('changes', {}))['freshness']
     assert fresh['latest_scan_complete'] and not fresh['refresh_due']
     assert fresh['checked_at'] == report['finished_at']
+
+
+async def test_deadline_digest_is_sorted_cached_and_lists_course(setup, monkeypatch):
+    from datetime import datetime, timezone
+    import courselink_mcp.server as server
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2040, 1, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(server, 'datetime', Clock)
+    _, service = setup
+    service.store.save_courses([{'id': '2', 'name': 'TEST*1000'}])
+    rows = [
+        ('later', '2040-01-03T00:00:00Z'),
+        ('earlier', '2040-01-02T00:30:00+02:00'),
+        ('offset', '2040-01-01T23:00:00Z'),
+        ('past', '2025-12-31T23:59:59Z'),
+        ('far', '2040-02-01T00:00:00Z'),
+        ('bad', 'invalid'), ('naive', '2040-01-02'), ('missing', None),
+    ]
+    service.store.reconcile('2', 'assignment', [
+        {'id': title, 'course_id': '2', 'kind': 'assignment', 'title': title, 'due_date': due}
+        for title, due in rows] + [
+        {'id': 'attachment', 'course_id': '2', 'kind': 'assignment', 'title': 'file',
+         'parent_id': 'later', 'due_date': rows[0][1]}])
+    # Exercise catalog pagination and exclusion of unavailable entries.
+    service.store.reconcile('1', 'content', [
+        {'id': f'padding{i}', 'course_id': '1', 'kind': 'content', 'title': 'No deadline'}
+        for i in range(501)])
+    service.store.reconcile('1', 'quiz', [
+        {'id': 'removed', 'course_id': '1', 'kind': 'quiz', 'title': 'Removed', 'due_date': rows[0][1]}])
+    service.store.reconcile('1', 'quiz', [])
+    async with service.scan_lock:
+        result = await API(service).call('deadline_digest', {})
+        assert result['freshness'] == service.freshness()
+    assert [row['id'] for row in result['deadlines']] == ['earlier', 'offset', 'later']
+    assert all(row['course_name'] == 'TEST*1000' for row in result['deadlines'])
+    assert not service.wake.is_set()
+    assert [row['id'] for row in (await API(service).call('deadline_digest', {'days': 1}))['deadlines']] == ['earlier', 'offset']
+
+
+async def test_whats_new_paginates_and_preserves_cursor_and_freshness(setup):
+    _, service = setup
+    service.store.reconcile('1', 'content', [
+        {'id': str(i), 'course_id': '1', 'kind': 'content', 'title': f'Item {i}'}
+        for i in range(501)])
+    api = API(service)
+    async with service.scan_lock:
+        result = await api.call('whats_new', {'since_cursor': None})
+        assert result['freshness'] == service.freshness()
+    expected = service.store.changes(limit=500)['changes']
+    expected += service.store.changes(after=expected[-1]['id'])['changes']
+    assert result['changes'] == expected
+    assert result['total'] == 501
+    assert sum(result['by_event'].values()) == 501
+    assert result['by_course'] == {'1': 501}
+    cursor = result['next_cursor']
+    empty = await api.call('whats_new', {'since_cursor': cursor})
+    assert empty['changes'] == [] and empty['next_cursor'] == cursor
+    service.store.reconcile('2', 'quiz', [
+        {'id': 'new', 'course_id': '2', 'kind': 'quiz', 'title': 'Quiz'}])
+    update = await api.call('whats_new', {'since_cursor': cursor})
+    assert update['total'] == 1 and update['changes'][0]['item_id'] == 'new'
+    assert not service.wake.is_set()
+
+
+@pytest.mark.parametrize('operation,arguments', [
+    ('deadline_digest', {'days': value}) for value in (0, -1, 366, True, '14')
+] + [('whats_new', {'since_cursor': value}) for value in (-1, True, '0')])
+async def test_cached_summary_validation(setup, operation, arguments):
+    _, service = setup
+    with pytest.raises(ValueError):
+        await API(service).call(operation, arguments)
+
+
+async def test_cached_summary_mcp_registration_and_dispatch(setup):
+    from mcp.server.fastmcp import FastMCP
+    from courselink_mcp.server import register_tools
+    _, service = setup
+    mcp = FastMCP('test')
+    register_tools(mcp, API(service).call)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    for name, args in [('deadline_digest', {}), ('whats_new', {'since_cursor': None})]:
+        assert tools[name].annotations.readOnlyHint
+        assert tools[name].annotations.destructiveHint is False
+        result = await mcp.call_tool(name, args)
+        assert result
+    assert tools['deadline_digest'].inputSchema['properties']['days']['default'] == 14
+    assert 'since_cursor' in tools['whats_new'].inputSchema['required']

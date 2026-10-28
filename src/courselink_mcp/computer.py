@@ -22,7 +22,10 @@ from .store import safe_name
 OPERATIONS = dict(status='courselink_status', courses='list_courses', items='list_items',
     item='get_item', materials='list_materials', document='read_document',
     search_documents='search_documents', changes='list_changes', versions='list_file_versions',
-    download='download_file', read_file='read_file', scan='check_now', login='open_login')
+    download='download_file', read_file='read_file', scan='check_now', login='open_login',
+    grades='get_grades', submissions='list_submissions', submission_status='submission_status',
+    submit_to_dropbox='submit_to_dropbox', quizzes='list_quizzes', quiz_status='quiz_status',
+    deadline_digest='deadline_digest', whats_new='whats_new')
 
 
 @asynccontextmanager

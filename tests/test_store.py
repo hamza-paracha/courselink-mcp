@@ -12,7 +12,7 @@ def test_change_cursor_reappearance_and_no_duplicates(tmp_path):
     store.reconcile('1', 'content', [content()])
     store.reconcile('1', 'content', [content()])
     assert len(store.changes()['changes']) == 1
-    store.reconcile('1', 'content', [content(due_date='2026-10-03')])
+    store.reconcile('1', 'content', [content(due_date='2040-10-03')])
     assert store.changes(after=1)['changes'][0]['details']['changed_fields'] == ['due_date']
     store.reconcile('1', 'content', [])
     assert not store.get('1:content:2')['available']
@@ -77,4 +77,22 @@ def test_listing_preserves_item_details_without_per_item_queries(tmp_path):
     result = store.items(course_id='1', kind='content', category='lab', limit=100, offset=20)
     assert result == {'total': 150, 'items': expected, 'offset': 20}
     assert len([query for query in queries if query.startswith('SELECT')]) == 2
+    store.close()
+
+
+def test_latest_version_query_is_bounded(tmp_path):
+    store = Store(tmp_path / 'db')
+    row = content()
+    store.reconcile('1', 'content', [row])
+    for index in range(20):
+        file = tmp_path / f'input{index}'
+        file.write_text(str(index))
+        store.record_file(row, file, tmp_path / f'saved{index}', str(index), len(str(index)))
+    queries = []
+    store.db.set_trace_callback(queries.append)
+    assert store.latest_version(row['id'])['sha256'] == '19'
+    assert 'LIMIT 1' in queries[-1]
+    store.file_checked(row)
+    assert not store.needs_download(row, 3600)
+    assert any('LIMIT 1' in q for q in queries)
     store.close()
