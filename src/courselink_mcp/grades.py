@@ -1,4 +1,5 @@
 """Read and normalize the current learner's grades; never retain feedback bodies."""
+import asyncio
 from html.parser import HTMLParser
 import math
 import re
@@ -179,6 +180,7 @@ def parse_html(html):
     parser = GradeTable()
     parser.feed(html)
     headers, items, categories, current, final = [], [], [], None, None
+    adjusted = None
     recognized = False
     data_rows = 0
     for cells in parser.rows:
@@ -256,7 +258,10 @@ def parse_html(html):
         if name.lower() == 'final calculated grade':
             if has_grade(row):
                 final = row
-        elif name.lower() != 'final adjusted grade':
+        elif name.lower() == 'final adjusted grade':
+            if has_grade(row):
+                adjusted = row
+        else:
             items.append(row)
     # Fail closed: a login/error/changed page must never erase a cached gradebook.
     if not recognized or not data_rows:
@@ -264,7 +269,8 @@ def parse_html(html):
         if 'grades' not in title or not re.search(r'no grades (?:have been |are )?(?:released|available)',
                                                  ' '.join(parser.page_text), re.I):
             raise ValueError('Unrecognized grades HTML; grades coverage could not be verified.')
-    return {'items': items, 'categories': categories, 'final_calculated_grade': final}
+    return {'items': items, 'categories': categories, 'final_calculated_grade': final,
+            'final_adjusted_grade': adjusted}
 
 
 async def fetch_grades(browser, course):
@@ -279,18 +285,24 @@ async def fetch_grades(browser, course):
             f'/d2l/lms/grades/my_grades/main.d2l?ou={course}', response_type='html'))
         return {**result, 'source': 'html', 'coverage': {'complete': True, 'errors': [],
                 'warnings': [grade_error(exc), 'HTML coverage includes visible rows only; some metadata is unavailable.']}}
-    objects, categories = [], []
-    for section, suffix in [('objects', ''), ('categories', 'categories/')]:
+    async def read_metadata(suffix, paged=True):
         try:
-            rows = await browser.paged(browser.api('le', base + suffix))
-            if section == 'objects':
-                objects = rows
-            else:
-                categories = rows
-        except (LoginRequired, RateLimited):
-            raise
+            path = browser.api('le', base + suffix)
+            return await browser.paged(path) if paged else await browser.get(path)
         except Exception as exc:
-            errors.append({'section': section, 'message': grade_error(exc)})
+            return exc
+
+    # Independent reads share BrowserSession's existing semaphore/cooldown.
+    objects, categories, final_value = await asyncio.gather(
+        read_metadata(''), read_metadata('categories/'),
+        read_metadata('final/values/myGradeValue', paged=False))
+    for section, rows in [('objects', objects), ('categories', categories)]:
+        if isinstance(rows, (LoginRequired, RateLimited)):
+            raise rows
+        if isinstance(rows, Exception):
+            errors.append({'section': section, 'message': grade_error(rows)})
+    objects = [] if isinstance(objects, Exception) else objects
+    categories = [] if isinstance(categories, Exception) else categories
     by_id = {str(o['Id']): o for o in objects}
     by_category = {str(c['Id']): c for c in categories}
     for cat in categories:
@@ -321,20 +333,32 @@ async def fetch_grades(browser, course):
             row['flags']['hidden_or_unreleased'] = True
             row['is_category'] = False
             items.append(row)
-    final = None
+    final = adjusted = None
+    for value in values:
+        if value.get('GradeObjectType') in (7, 8):
+            row = normalize(value, by_id.get(str(value.get('GradeObjectIdentifier')), {}))
+            if has_grade(row):
+                if value['GradeObjectType'] == 7:
+                    final = row
+                else:
+                    adjusted = row
     try:
-        value = await browser.get(browser.api('le', base + 'final/values/myGradeValue'))
+        if isinstance(final_value, Exception):
+            raise final_value
+        value = final_value
         if value is not None:
             if not isinstance(value, dict):
                 raise ValueError('Unrecognized final grade response.')
             if value.get('GradeObjectType') not in (None, 7, 8):
                 raise ValueError('Unrecognized final grade type.')
-            if (value and value.get('GradeObjectType') != 8
-                    and value.get('IsReleased') is not False and value.get('IsHidden') is not True
+            if (value and value.get('IsReleased') is not False and value.get('IsHidden') is not True
                     and ('ReleasedDate' not in value or value['ReleasedDate'] is not None)):
                 row = normalize(value)
                 if has_grade(row):
-                    final = row
+                    if value.get('GradeObjectType') == 8:
+                        adjusted = row
+                    else:
+                        final = row
     except EndpointUnavailable as exc:
         if exc.status_code == 404:
             warnings.append('No final calculated grade available (HTTP 404).')
@@ -349,4 +373,4 @@ async def fetch_grades(browser, course):
         'highest_to_drop': c.get('NumberOfHighestToDrop'), 'lowest_to_drop': c.get('NumberOfLowestToDrop')}
         for c in categories]
     return {'items': items, 'categories': safe_categories, 'final_calculated_grade': final,
-            'source': 'api', 'coverage': {'complete': not errors, 'errors': errors, 'warnings': warnings}}
+            'final_adjusted_grade': adjusted, 'source': 'api', 'coverage': {'complete': not errors, 'errors': errors, 'warnings': warnings}}

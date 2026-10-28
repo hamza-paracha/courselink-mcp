@@ -20,6 +20,8 @@ from .catalog import Catalog, linked_files
 from .store import Store, now, safe_name
 from .grades import fetch_grades, grade_error, has_grade
 from .extract import EXTRACTOR_VERSION
+from .submissions import Submissions, background_monitor
+from .quizzes import Quizzes
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +44,8 @@ class Service:
         self.extract_lock = asyncio.Lock()
         self.heartbeats = {}
         self.verify_files_requested = False
+        self.submissions = Submissions(self)
+        self.quizzes = Quizzes(self)
 
     @contextmanager
     def phase(self, report, name):
@@ -108,10 +112,12 @@ class Service:
                 results.append({'course_id': course, 'folder': self.config.courses[course],
                     'items': cached.get('items', []), 'categories': cached.get('categories', []),
                     'final_calculated_grade': cached.get('final_calculated_grade'),
+                    'final_adjusted_grade': cached.get('final_adjusted_grade'),
                     'source': cached.get('source'), 'checked_at': checked,
                     'last_attempt_at': cached.get('last_attempt_at'), 'coverage': coverage,
                     'no_grades_released': (not any(has_grade(row) for row in cached.get('items', []))
                         and cached.get('final_calculated_grade') is None
+                        and cached.get('final_adjusted_grade') is None
                         if checked and coverage['complete'] else None),
                     'freshness': {'checked_at': checked, 'age_seconds': round(max(0, age), 1) if age is not None else None,
                         'refresh_interval_seconds': self.config.poll_seconds,
@@ -123,8 +129,15 @@ class Service:
 
     async def start(self):
         self.heartbeats = {name: time.monotonic() for name in ('session', 'scan', 'index')}
-        self.tasks = [asyncio.create_task(self.session_loop()), asyncio.create_task(self.scan_loop()),
-                      asyncio.create_task(self.index_loop())]
+        self.tasks = [asyncio.create_task(self.run_worker(worker)) for worker in
+                      (self.session_loop, self.scan_loop, self.index_loop)]
+
+    async def run_worker(self, worker):
+        token = background_monitor.set(True)
+        try:
+            await worker()
+        finally:
+            background_monitor.reset(token)
 
     async def close(self):
         for task in self.tasks:

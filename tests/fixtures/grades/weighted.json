@@ -1,6 +1,6 @@
 {
   "values": [
-    {"GradeObjectIdentifier":"11","GradeObjectName":"Lab 1","GradeObjectType":1,"PointsNumerator":8,"PointsDenominator":10,"WeightedNumerator":4,"WeightedDenominator":5,"DisplayedGrade":"80 %","Comments":{"Html":"<p>Synthetic feedback: revise discussion.</p>"},"PrivateComments":{"Text":"Synthetic private note"},"LastModified":"2026-10-20T12:00:00Z"},
+    {"GradeObjectIdentifier":"11","GradeObjectName":"Lab 1","GradeObjectType":1,"PointsNumerator":8,"PointsDenominator":10,"WeightedNumerator":4,"WeightedDenominator":5,"DisplayedGrade":"80 %","Comments":{"Html":"<p>Synthetic feedback: revise discussion.</p>"},"PrivateComments":{"Text":"Synthetic private note"},"LastModified":"2040-10-20T12:00:00Z"},
     {"GradeObjectIdentifier":"12","GradeObjectName":"Lab 2","GradeObjectType":1,"PointsNumerator":null,"PointsDenominator":10,"WeightedNumerator":null,"WeightedDenominator":5,"DisplayedGrade":"","Comments":{"Text":""}},
     {"GradeObjectIdentifier":"13","GradeObjectName":"Participation","GradeObjectType":4,"DisplayedGrade":"Complete","Comments":{"Text":""}},
     {"GradeObjectIdentifier":"14","GradeObjectName":"Extra credit","GradeObjectType":1,"PointsNumerator":1,"PointsDenominator":0,"DisplayedGrade":"1","IsDropped":true},
@@ -14,5 +14,5 @@
     {"Id":15,"Name":"Midterm","CategoryId":0,"MaxPoints":100,"IsHidden":true}
   ],
   "categories": [{"Id":10,"Name":"Labs","Weight":20,"MaxPoints":20,"ExcludeFromFinalGrade":false,"NumberOfLowestToDrop":1,"NumberOfHighestToDrop":0}],
-  "final": {"GradeObjectIdentifier":"99","GradeObjectName":"Final Calculated Grade","GradeObjectType":7,"PointsNumerator":80,"PointsDenominator":100,"WeightedNumerator":80,"WeightedDenominator":100,"DisplayedGrade":"A-","ReleasedDate":"2026-10-21T12:00:00Z","LastModified":"2026-10-21T11:00:00Z"}
+  "final": {"GradeObjectIdentifier":"99","GradeObjectName":"Final Calculated Grade","GradeObjectType":7,"PointsNumerator":80,"PointsDenominator":100,"WeightedNumerator":80,"WeightedDenominator":100,"DisplayedGrade":"A-","ReleasedDate":"2040-10-21T12:00:00Z","LastModified":"2040-10-21T11:00:00Z"}
 }

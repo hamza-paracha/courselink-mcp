@@ -8,10 +8,15 @@ got tired of opening CourseLink, clicking through every course, and downloading 
 
 - **check in from chat.** after connecting your monitor, select CourseLink in ChatGPT (or mention `@CourseLink` when available) and ask “anything new?” or “what’s due next?” Claude works through connectors too. you don’t need a coding agent for everyday use.
 - **get the assignment details.** ask “what do i need for this assignment?” to find instructions and search downloaded documents.
-- **have files ready to work with.** the monitor downloads course files and keeps older versions when they change. if it runs remotely, optional sync brings them to your computer. open the course folder in Codex, Claude Code, Hermes, or another local assistant to get help with the material.
-- **check your grades.** `get_grades(course_id=None)` reads released grades for one or all monitored courses, including points, weights, categories, and a released final calculated grade. Results include per-course freshness and coverage errors.
+- **have files ready to work with.** the monitor downloads course files and keeps older versions when they change. if it runs remotely, optional sync brings them to your computer. open the course folder in Codex, Claude Code, or another local assistant to get help with the material.
+- **check your grades.** `get_grades(course_id=None)` reads released grades for one or all monitored courses, including points, weights, categories, and released calculated/adjusted final grades. Results include per-course freshness and coverage errors.
 
 To check grades through an already running monitor, use `uv run courselink grades --course example-course --json` (omit `--course` for all monitored courses). Add `--refresh` for a live fetch through its existing session. This command never starts the monitor or opens sign-in. Grades use an on-demand cache; regular background material scans do not refresh them.
+
+**Quiz attempts:** `list_quizzes(course_id, quiz_id=None)` browses learner summaries; `quiz_status(course_id, query)` answers whether a quiz was attempted, how many attempts are completed, and whether it is still open. Both are read-only and never start or submit a quiz. See [quiz tracking, scores and coverage](docs/quizzes.md).
+
+**Submission history and uploads:** `list_submissions` and `submission_status` answer what was submitted and when. `submit_to_dropbox` previews by default; an actual upload requires explicit confirmation with its single-use preview token, plus separate late approval when past due. See the [tool schemas, safety rules and offline limitations](docs/submissions.md).
+
 
 routine update checks read the cache immediately. background metadata scans target every 5 minutes while running; unchanged-looking files get byte checks hourly. results include when the data was last checked.
 

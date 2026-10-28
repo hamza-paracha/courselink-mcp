@@ -205,11 +205,15 @@ class Store:
     def versions(self, item_id):
         return [dict(r) for r in self.db.execute('SELECT * FROM versions WHERE item_id=? ORDER BY id DESC', (item_id,))]
 
+    def latest_version(self, item_id):
+        row = self.db.execute('SELECT * FROM versions WHERE item_id=? ORDER BY id DESC LIMIT 1', (item_id,)).fetchone()
+        return dict(row) if row else None
+
     def record_file(self, item, temporary, destination, digest, size):
-        latest = self.versions(item['id'])
-        if latest and latest[0]['sha256'] == digest and Path(latest[0]['path']).is_file():
+        latest = self.latest_version(item['id'])
+        if latest and latest['sha256'] == digest and Path(latest['path']).is_file():
             temporary.unlink()
-            return latest[0], False
+            return latest, False
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary.replace(destination)
         with self.db:
@@ -228,9 +232,9 @@ class Store:
     def needs_download(self, item, seconds):
         row = self.db.execute('''SELECT f.checked_at, f.fingerprint AS checked_fingerprint, i.fingerprint
             FROM items i LEFT JOIN file_checks f ON f.item_id=i.id WHERE i.id=?''', (item['id'],)).fetchone()
-        versions = self.versions(item['id'])
-        if not row or not row['checked_at'] or row['fingerprint'] != row['checked_fingerprint'] or not versions:
+        version = self.latest_version(item['id'])
+        if not row or not row['checked_at'] or row['fingerprint'] != row['checked_fingerprint'] or not version:
             return True
-        if not Path(versions[0]['path']).is_file():
+        if not Path(version['path']).is_file():
             return True
         return (datetime.now(timezone.utc) - datetime.fromisoformat(row['checked_at'])).total_seconds() >= seconds

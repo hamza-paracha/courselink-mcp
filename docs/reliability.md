@@ -53,7 +53,7 @@ systemctl --user status courselink.service courselink-watchdog.timer courselink-
 journalctl --user -u courselink-watchdog.service -u courselink-backup.service -n 30 --no-pager
 ```
 
-A healthy process does not prove fresh course data. Check `courselink status` for authentication, `last_scan.finished_at`, `complete`, and scan errors. These jobs cannot prevent Oracle outages, renew a revoked login, or guarantee permanent availability. A future alert destination can notify you of those failures; no email or messaging integration is configured by these units.
+A healthy process does not prove fresh course data. Check `courselink status` for authentication, `last_scan.finished_at`, `complete`, and scan errors. These jobs cannot prevent host outages, renew a revoked login, or guarantee permanent availability. A future alert destination can notify you of those failures; no email or messaging integration is configured by these units.
 
 For a thorough check, use `courselink check --verify-files` or the MCP tool `check_now(force_refresh=True, verify_files=True)`. This queues a scan that rechecks every accessible downloadable file, including files whose bytes changed without a metadata change. Wait for a new completed `last_scan` with `verify_files: true`; the queue response does not mean the scan has finished. `duration_seconds` records actual scan time. Normal scans use the configured file-check interval to avoid repeatedly transferring unchanged files.
 
