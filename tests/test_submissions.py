@@ -105,10 +105,10 @@ async def test_history_cache_status_and_unknown_coverage(service):
 
 
 @pytest.mark.parametrize('submitted,due,expected', [
-    ('2040-01-01T12:00:00Z', '2040-01-01T07:00:00-05:00', False),
-    ('2040-01-01T12:00:01Z', '2040-01-01T12:00:00Z', True),
-    (None, '2040-01-01T12:00:00Z', None), ('bad', 'bad', None),
-    ('2040-01-01T12:00:00', '2040-01-01T12:00:00Z', None),
+    ('2026-01-01T12:00:00Z', '2026-01-01T07:00:00-05:00', False),
+    ('2026-01-01T12:00:01Z', '2026-01-01T12:00:00Z', True),
+    (None, '2026-01-01T12:00:00Z', None), ('bad', 'bad', None),
+    ('2026-01-01T12:00:00', '2026-01-01T12:00:00Z', None),
 ])
 def test_lateness(submitted, due, expected):
     assert lateness(submitted, due) is expected
@@ -168,9 +168,25 @@ async def test_resubmission_unknown_or_denied(service, files, policy):
     service.browser.folders[0]['AllowResubmission'] = policy
     preview = await service.submissions.submit('123', '10', files)
     assert preview['allows_resubmission'] is policy
-    with pytest.raises(ValueError, match='Resubmission'):
+    with pytest.raises(ValueError, match='resubmi'):
         await service.submissions.submit('123', '10', files, True, preview['preview_token'])
     service.browser.upload_dropbox.assert_not_awaited()
+
+
+async def test_unknown_resubmission_needs_explicit_override_and_denied_never_overridden(service, files):
+    service.browser.folders[0]['AllowResubmission'] = False
+    preview = await service.submissions.submit('123', '10', files)
+    with pytest.raises(ValueError, match='not allowed'):
+        await service.submissions.submit('123', '10', files, True, preview['preview_token'], allow_resubmit=True)
+    service.browser.upload_dropbox.assert_not_awaited()
+    service.browser.folders[0]['AllowResubmission'] = None
+    preview = await service.submissions.submit('123', '10', files)
+    with pytest.raises(ValueError, match='allow_resubmit=true'):
+        await service.submissions.submit('123', '10', files, True, preview['preview_token'])
+    preview = await service.submissions.submit('123', '10', files)
+    result = await service.submissions.submit('123', '10', files, True, preview['preview_token'], allow_resubmit=True)
+    assert result['outcome'] == 'submitted'
+    service.browser.upload_dropbox.assert_awaited_once()
 
 
 @pytest.mark.parametrize('kind', ['empty', 'oversized', 'executable', 'extension', 'symlink', 'directory', 'outside', 'duplicate', 'fifo'])
@@ -210,8 +226,12 @@ async def test_odd_files_are_rejected_and_audited(service, files, kind):
 
 
 async def test_missing_files_closed_folder_and_invalid_input(service, files):
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match='File not found on the service host'):
         await service.submissions.submit('123', '10', [str(service.config.school / 'missing.txt')])
+    with pytest.raises(ValueError, match='not under the school directory'):
+        await service.submissions.submit('123', '10', ['/workspace/elsewhere/Lab3.zip'])
+    with pytest.raises(ValueError, match='must be absolute'):
+        await service.submissions.submit('123', '10', ['relative/Lab3.zip'])
     with pytest.raises(ValueError):
         await service.submissions.submit('123', None, files)
     with pytest.raises(ValueError):
@@ -328,9 +348,9 @@ def history_fixture(kind='two_submissions'):
 
 
 @pytest.mark.parametrize('evidence', ['both', 'marker', 'table'])
-def test_headerless_empty_history(evidence):
+def test_real_empty_history(evidence):
     from courselink_mcp.submissions import parse_history
-    html = history_fixture('headerless_empty')
+    html = history_fixture('empty_state')
     if evidence == 'marker':
         html = html.replace('d_gempty', '')
     elif evidence == 'table':
@@ -338,16 +358,16 @@ def test_headerless_empty_history(evidence):
     assert parse_history(html, '41001', None) == ([], {'complete': True, 'errors': []})
 
 
-def test_headerless_empty_history_mismatched_folder():
+def test_real_empty_history_mismatched_folder():
     from courselink_mcp.submissions import parse_history
     with pytest.raises(ValueError, match='selected folder does not match'):
-        parse_history(history_fixture('headerless_empty'), '41002', None)
+        parse_history(history_fixture('empty_state'), '41002', None)
 
 
 @pytest.mark.parametrize('mutation', ['no_evidence', 'wrong_summary', 'row'])
-def test_headerless_empty_history_requires_recognized_evidence(mutation):
+def test_real_empty_history_requires_recognized_evidence(mutation):
     from courselink_mcp.submissions import parse_history
-    html = history_fixture('headerless_empty')
+    html = history_fixture('empty_state')
     if mutation == 'row':
         html = html.replace('no-column-border=""></table>',
                             'no-column-border=""><tr><td>Unknown</td></tr></table>')
@@ -470,7 +490,7 @@ async def test_history_workers_are_bounded_and_overlap(service):
 
 def test_history_winter_timezone():
     from courselink_mcp.submissions import history_datetime
-    assert history_datetime('Jan 21, 2040 6:53 PM') == '2040-01-21T23:53:00Z'
+    assert history_datetime('Jan 21, 2026 6:53 PM') == '2026-01-21T23:53:00Z'
     assert history_datetime('invalid') is None
 
 

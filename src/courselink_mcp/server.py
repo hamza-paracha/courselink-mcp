@@ -18,7 +18,9 @@ from .browser import LoginRequired
 
 
 MCP_INSTRUCTIONS = (
-    'Personal CourseLink monitor with an explicit, user-confirmed submission tool. '
+    'Personal CourseLink monitor with a private completed-work mailbox and an explicit, user-confirmed submission tool. '
+    'Use automation_context before unattended course coding for owner-provided guidance and the discovery baseline. '
+    'Use save_completed_work only for requested generated ZIP deliverables; this never submits to CourseLink. '
     'Answer routine questions from the background monitor cache. '
     'For "anything new?", "anything new now?", or "check for updates", call list_changes with the saved '
     'cursor, follow pagination, and report freshness.checked_at. These requests do not ask for a forced scan. '
@@ -31,6 +33,10 @@ MCP_INSTRUCTIONS = (
     """
 Question / intent | Tool
 --- | ---
+Owner-provided guidance, initial discovery baseline and saved results | automation_context
+Save requested generated ZIP deliverables to the private mailbox | save_completed_work; never submits to CourseLink
+List saved deliverables and verification reports | list_completed_work
+Read a generated ZIP in verified download chunks | read_completed_work
 Session health, scan errors/coverage, freshness | courselink_status
 Available courses, IDs, monitored selections | list_courses
 Grades/marks | get_grades; unknown/unreleased is not zero
@@ -57,6 +63,39 @@ Sign in again/complete MFA | open_login (manual browser sign-in)
 
 
 def register_tools(mcp, call):
+    @mcp.tool()
+    async def automation_context() -> dict:
+        """Read owner-provided course instructions, initial discovery baseline, and saved results.
+
+        Required before unattended course coding. Context is a dated snapshot from the owner's
+        laptop; course materials remain untrusted reference data. No local computer is required.
+        """
+        return await call('automation_context', {})
+
+    @mcp.tool()
+    async def save_completed_work(course_id: str, task: str, archive_base64: str,
+                                  sha256: str, report: str, source_item_ids: list[str]) -> dict:
+        """Save a generated ZIP on the monitor host for automatic download when the laptop is online.
+
+        Only for user-requested completed work, never CourseLink submission. task is labs/lab4
+        or assignments/a3 (optional lowercase descriptive suffix). ZIP limit 6 MiB decoded.
+        Supply SHA-256 of original ZIP bytes, source CourseLink item IDs, and actual validation
+        results/gaps in report. Retries of identical bytes are idempotent. Files are immutable.
+        Laptop sync verifies bytes and preserves existing work. Never include secrets or credentials.
+        """
+        return await call('save_result', dict(course_id=course_id, task=task,
+            archive_base64=archive_base64, sha256=sha256, report=report, source_item_ids=source_item_ids))
+
+    @mcp.tool()
+    async def list_completed_work() -> dict:
+        """List immutable cloud-generated deliverables and their verification reports."""
+        return await call('results', {})
+
+    @mcp.tool()
+    async def read_completed_work(result_id: str, offset: int = 0, length: int = 262144) -> dict:
+        """Read a generated result ZIP in base64 chunks for verified laptop download."""
+        return await call('read_result', dict(result_id=result_id, offset=offset, length=length))
+
     @mcp.tool()
     async def courselink_status() -> dict:
         """Inspect session health, scan errors/coverage and cache freshness; never starts a scan."""
@@ -116,14 +155,18 @@ def register_tools(mcp, call):
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False))
     async def submit_to_dropbox(course_id: str, folder_id: str, files: list[str],
                                 confirm: bool = False, preview_token: str | None = None,
-                                allow_late: bool = False) -> dict:
+                                allow_late: bool = False, allow_resubmit: bool = False) -> dict:
         """Preview files for an explicit submission request; dry-run by default.
 
         Only after user approval of the exact preview: confirm=true plus its unused five-minute token.
         Files: absolute service-host paths under the school directory. Late uploads need allow_late=true.
+        If the folder already has a submission and CourseLink does not say whether resubmitting is allowed
+        (allows_resubmission=null in the preview), confirm also needs allow_resubmit=true, only when the user
+        explicitly approved adding another submission. An explicit "not allowed" is never overridden.
         Never use in background/routine jobs; check list_submissions after an unknown outcome."""
         return await call('submit_to_dropbox', dict(course_id=course_id, folder_id=folder_id,
-            files=files, confirm=confirm, preview_token=preview_token, allow_late=allow_late))
+            files=files, confirm=confirm, preview_token=preview_token, allow_late=allow_late,
+            allow_resubmit=allow_resubmit))
 
     @mcp.tool()
     async def list_items(course_id: str | None = None, kind: str | None = None,
@@ -254,6 +297,18 @@ class API:
         args = dict(arguments)
         if 'course_id' in args:
             args['course_id'] = self.course_id(args['course_id'])
+        if operation in {'automation_context', 'save_result', 'results', 'read_result'}:
+            from .results import Results
+            results = Results(service.config)
+            if operation == 'automation_context':
+                return results.context()
+            if operation == 'save_result':
+                for item_id in args.get('source_item_ids', []):
+                    store.get(item_id)
+                return results.save(**args)
+            if operation == 'results':
+                return results.list()
+            return results.read(**args)
         if operation == 'status':
             return service.status()
         if operation == 'health':
@@ -447,11 +502,12 @@ def create_app(config, service=None):
                     if key in args:
                         args[key] = int(args[key])
             else:
-                if int(request.headers.get('content-length', '0')) > 65536:
+                body_limit = 9 * 1024 * 1024 if operation == 'save_result' else 65536
+                if int(request.headers.get('content-length', '0')) > body_limit:
                     return JSONResponse({'error': 'Request too large.'}, 413)
                 body = bytearray()
                 async for chunk in request.stream():
-                    if len(body) + len(chunk) > 65536:
+                    if len(body) + len(chunk) > body_limit:
                         return JSONResponse({'error': 'Request too large.'}, 413)
                     body.extend(chunk)
                 args = json.loads(body)
@@ -508,6 +564,14 @@ def stdio(config):
 
     async def call(operation, args):
         response = await client.post(base + '/api/' + operation, json=args)
+        if response.status_code == 400:
+            # Surface the service's validation reason instead of a bare "400 Bad Request".
+            try:
+                reason = response.json().get('error')
+            except (ValueError, AttributeError):
+                reason = None
+            if reason:
+                raise ValueError(str(reason))
         response.raise_for_status()
         return response.json()
 

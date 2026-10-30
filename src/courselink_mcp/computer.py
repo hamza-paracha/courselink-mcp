@@ -25,7 +25,9 @@ OPERATIONS = dict(status='courselink_status', courses='list_courses', items='lis
     download='download_file', read_file='read_file', scan='check_now', login='open_login',
     grades='get_grades', submissions='list_submissions', submission_status='submission_status',
     submit_to_dropbox='submit_to_dropbox', quizzes='list_quizzes', quiz_status='quiz_status',
-    deadline_digest='deadline_digest', whats_new='whats_new')
+    deadline_digest='deadline_digest', whats_new='whats_new',
+    automation_context='automation_context', save_result='save_completed_work',
+    results='list_completed_work', read_result='read_completed_work')
 
 
 @asynccontextmanager
@@ -91,6 +93,72 @@ class Computer:
         if not root.resolve().is_relative_to(school):
             raise ValueError('Download directory escapes School.')
         return root
+
+    async def sync_results(self):
+        """Download immutable ZIPs; do not execute, extract, or replace local work."""
+        report = {'files': [], 'errors': []}
+        async with self.lock:
+            with (self.config.state / 'result-sync.lock').open('a') as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise ValueError('Another results sync is running.')
+                for result in (await self.call('results', {}))['results']:
+                    try:
+                        if result['course_id'] not in self.config.courses:
+                            continue
+                        if not re.fullmatch(r'(labs/lab[0-9]+|assignments/a[0-9]+)(-[a-z0-9-]+)?', result['task']):
+                            raise ValueError('Unsafe task directory.')
+                        if not re.fullmatch('[0-9a-f]{64}', result['id']):
+                            raise ValueError('Unsafe result ID.')
+                        # Use the existing verified download routine with a result-only reader.
+                        directory = self.root(result['course_id'])
+                        for part in result['task'].split('/') + ['submission']:
+                            directory = directory / part
+                            if directory.is_symlink():
+                                raise ValueError('Results directory must not be a symlink.')
+                            directory.mkdir(exist_ok=True)
+                        destination = directory / ('cloud-' + result['id'][:16] + '.zip')
+                        if destination.exists() or destination.is_symlink():
+                            if (destination.is_symlink() or
+                                    hashlib.sha256(destination.read_bytes()).hexdigest() != result['sha256']):
+                                raise ValueError('Existing local result differs; preserving it.')
+                            report['files'].append({'path': str(destination), 'saved': False})
+                            continue
+                        digest, size = result['sha256'], result['size']
+                        if not re.fullmatch('[0-9a-f]{64}', digest) or not 0 <= size <= 6 * 1024 * 1024:
+                            raise ValueError('Invalid result hash/size.')
+                        temporary = None
+                        try:
+                            hasher, offset = hashlib.sha256(), 0
+                            with tempfile.NamedTemporaryFile(dir=directory, suffix='.partial', delete=False) as handle:
+                                temporary = Path(handle.name)
+                                while True:
+                                    chunk = await self.call('read_result', {'result_id': result['id'], 'offset': offset})
+                                    data = base64.b64decode(chunk['base64'], validate=True)
+                                    if chunk['offset'] != offset or chunk['next_offset'] != offset + len(data):
+                                        raise ValueError('Invalid result offset.')
+                                    offset += len(data)
+                                    if offset > size or (not data and not chunk['eof']):
+                                        raise ValueError('Invalid result transfer length.')
+                                    handle.write(data)
+                                    hasher.update(data)
+                                    if chunk['eof']:
+                                        break
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                            if offset != size or hasher.hexdigest() != digest:
+                                raise ValueError('Result transfer size/hash mismatch.')
+                            os.link(temporary, destination)
+                        finally:
+                            if temporary and temporary.exists():
+                                temporary.unlink()
+                        report['files'].append({'path': str(destination), 'saved': True})
+                    except Exception as exc:
+                        report['errors'].append({'id': result.get('id'), 'message': str(exc)[:400]})
+        report.update(complete=not report['errors'], checked_at=datetime.now(timezone.utc).isoformat())
+        write_json(self.config.state / 'last-result-sync.json', report)
+        return report
 
     async def save(self, item, version):
         digest = version['sha256']
@@ -266,3 +334,8 @@ async def computer_stdio(config):
 async def sync_command(config, course_id=None):
     async with connect() as call:
         return await Computer(config, call).sync(course_id)
+
+
+async def result_sync_command(config):
+    async with connect() as call:
+        return await Computer(config, call).sync_results()

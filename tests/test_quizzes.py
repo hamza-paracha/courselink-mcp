@@ -191,7 +191,7 @@ async def test_server_tool_schemas_dispatch_and_rest(service):
     mcp = FastMCP('test')
     register_tools(mcp, API(service).call)
     tools = {t.name: t for t in await mcp.list_tools()}
-    assert len(tools) == 21
+    assert len(tools) == 25
     for name in ('list_quizzes', 'quiz_status'):
         assert tools[name].annotations.readOnlyHint and not tools[name].annotations.destructiveHint
         assert 'deadline_digest' in tools[name].description

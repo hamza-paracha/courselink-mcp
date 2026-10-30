@@ -350,3 +350,39 @@ async def test_cached_summary_mcp_registration_and_dispatch(setup):
         assert result
     assert tools['deadline_digest'].inputSchema['properties']['days']['default'] == 14
     assert 'since_cursor' in tools['whats_new'].inputSchema['required']
+
+
+async def test_private_mailbox_http_roundtrip_above_standard_body_limit(setup):
+    """The public upgrade must retain the monitor’s larger, authenticated result route."""
+    import base64
+    import hashlib
+    import io
+    import zipfile
+
+    config, service = setup
+    item_id = '1:content:2'
+    service.store.reconcile('1', 'content', [
+        {'id': item_id, 'course_id': '1', 'kind': 'content', 'title': 'Synthetic instructions'}])
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        archive.writestr('src/main.c', '/* synthetic source */\n' * 4000)
+    data = buffer.getvalue()
+    args = dict(course_id='1', task='labs/lab4', archive_base64=base64.b64encode(data).decode(),
+                sha256=hashlib.sha256(data).hexdigest(), report='Synthetic offline verification.',
+                source_item_ids=[item_id])
+    assert len(args['archive_base64']) > 65536
+    transport = httpx.ASGITransport(app=create_app(config, service))
+    async with httpx.AsyncClient(transport=transport, base_url='http://localhost') as client:
+        assert (await client.post('/api/save_result', json=args)).status_code == 401
+        client.headers['Authorization'] = 'Bearer ' + config.token()
+        saved = await client.post('/api/save_result', json=args)
+        assert saved.status_code == 200
+        result = saved.json()
+        listed = await client.post('/api/results', json={})
+        assert listed.json()['results'] == [result]
+        context = await client.post('/api/automation_context', json={})
+        assert context.json()['results'] == [result]
+        read = await client.post('/api/read_result', json={'result_id': result['id']})
+        assert base64.b64decode(read.json()['base64']) == data
+        bad_source = await client.post('/api/save_result', json={**args, 'source_item_ids': ['1:content:999']})
+        assert bad_source.status_code == 400

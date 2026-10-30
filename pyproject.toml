@@ -1,6 +1,6 @@
 [project]
 name = "courselink-mcp"
-version = "0.1.0"
+version = "0.2.0"
 authors = [{ name = "CourseLink MCP contributors" }]
 description = "CourseLink monitor, versioned downloads, and MCP server"
 readme = "README.md"

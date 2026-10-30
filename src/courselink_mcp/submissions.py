@@ -322,8 +322,14 @@ class Submissions:
             if not isinstance(value, str):
                 raise ValueError('File paths must be strings.')
             path = Path(value)
-            if not path.is_absolute() or path.is_symlink() or not path.resolve().is_relative_to(root):
-                raise ValueError('Files must be regular files under the configured school directory, without symlinks.')
+            if not path.is_absolute():
+                raise ValueError(f'Path must be absolute on the service host: {value}')
+            if not path.resolve().is_relative_to(root):
+                raise ValueError(f'Path not under the school directory ({root}): {value}')
+            if not path.exists():
+                raise ValueError(f'File not found on the service host: {value}')
+            if path.is_symlink():
+                raise ValueError(f'Symlinks are not allowed: {value}')
             if any(p.is_symlink() for p in path.parents):
                 raise ValueError('Symlink directories are not allowed.')
             if (path.suffix.lower() not in allowed or not re.fullmatch(r'[\w][\w .()-]{0,199}', path.name)
@@ -362,14 +368,15 @@ class Submissions:
             handle.flush()
             os.fsync(handle.fileno())
 
-    async def submit(self, course_id, folder_id, files, confirm=False, preview_token=None, allow_late=False):
+    async def submit(self, course_id, folder_id, files, confirm=False, preview_token=None, allow_late=False,
+                     allow_resubmit=False):
         attempt = secrets.token_hex(12)
         self.audit(attempt, 'attempt', confirmed=confirm is True)
         try:
             require_interactive_submission()
             identifier(folder_id)
-            if type(confirm) is not bool or type(allow_late) is not bool:
-                raise ValueError('confirm and allow_late must be booleans.')
+            if type(confirm) is not bool or type(allow_late) is not bool or type(allow_resubmit) is not bool:
+                raise ValueError('confirm, allow_late and allow_resubmit must be booleans.')
             async with self.upload_lock:
                 self.previews = {k: v for k, v in self.previews.items() if v[0] > time.monotonic()}
                 previous = self.previews.pop(preview_token, None) if isinstance(preview_token, str) else None
@@ -403,8 +410,13 @@ class Submissions:
                     raise ValueError('Files or folder state changed; preview again.')
                 if late and not allow_late:
                     raise ValueError('Past due; allow_late=true is also required.')
-                if folder['submissions'] and folder['allows_resubmission'] is not True:
-                    raise ValueError('Resubmission permission is unknown or denied.')
+                if folder['submissions'] and folder['allows_resubmission'] is False:
+                    raise ValueError('This folder already has a submission and CourseLink says resubmission is not allowed.')
+                if folder['submissions'] and folder['allows_resubmission'] is None and not allow_resubmit:
+                    raise ValueError(
+                        f"This folder already has {len(folder['submissions'])} submission(s) and CourseLink does not say "
+                        'whether resubmitting is allowed. Preview again and confirm with allow_resubmit=true '
+                        'only if the user explicitly approved adding another submission.')
                 availability = folder['availability'] or {}
                 current = datetime.now(timezone.utc)
                 start, end = timestamp(availability.get('StartDate')), timestamp(availability.get('EndDate'))

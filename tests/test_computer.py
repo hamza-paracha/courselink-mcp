@@ -180,3 +180,15 @@ async def test_fresh_sync_reuses_scan_downloads_and_reports_partial_coverage(set
     result = await computer.sync(refresh=False)
     assert result['unchanged'] == 1
     assert 'read_file' not in calls and 'download' not in calls
+
+
+def test_registered_remote_tools_have_forwarding_operations():
+    from courselink_mcp.computer import OPERATIONS
+    from courselink_mcp.server import register_tools
+    class Registry:
+        def tool(self, **kwargs):
+            def register(function):
+                assert function.__name__ in OPERATIONS.values(), function.__name__
+                return function
+            return register
+    register_tools(Registry(), None)

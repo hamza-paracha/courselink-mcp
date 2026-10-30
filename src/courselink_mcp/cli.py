@@ -32,6 +32,7 @@ def main():
     sub.add_parser('computer-stdio', help='Local MCP bridge with downloads into local course folders')
     sync = sub.add_parser('sync', help='Sync remote files and course metadata onto this computer')
     sync.add_argument('--course', default=None)
+    sub.add_parser('sync-results', help='Download completed cloud ZIPs while this computer is online')
     sub.add_parser('login', help='Sign in once before starting the service')
     sub.add_parser('status', help='Read service health')
     check = sub.add_parser('check', help='Queue a fresh scan')
@@ -69,10 +70,11 @@ def main():
         from .computer import computer_stdio
         asyncio.run(computer_stdio(config))
         return
-    if args.command == 'sync':
-        from .computer import sync_command
+    if args.command in ('sync', 'sync-results'):
+        from .computer import sync_command, result_sync_command
         try:
-            report = asyncio.run(sync_command(config, args.course))
+            report = asyncio.run(result_sync_command(config) if args.command == 'sync-results'
+                                 else sync_command(config, args.course))
             print(json.dumps(report, indent=2))
             if not report['complete']:
                 sys.exit(1)

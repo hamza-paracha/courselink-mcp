@@ -32,3 +32,21 @@ clone this repo and follow the [setup guide](docs/setup.md), or ask a coding ass
 [Claude chat setup](docs/setup.md#use-courselink-in-claude-chat) · [ChatGPT connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt) · [server reliability](docs/reliability.md)
 
 made by [@CourseLink MCP contributors](https://example.invalid/courselink).
+
+## cloud-generated deliverables
+
+An authenticated coding assistant can read owner-provided instructions and the
+initial discovery baseline with `automation_context`, then save requested ZIP
+deliverables with `save_completed_work`. This private mailbox never submits work
+to CourseLink. Archives are immutable, limited to 6 MiB, and include source item
+IDs plus an honest validation report in their metadata. The monitor does not
+execute or extract them.
+
+On an already configured computer bridge, `courselink sync-results` downloads
+these ZIPs into the mapped course’s `CourseLink Downloads/labs/labN/submission/` or
+`CourseLink Downloads/assignments/aN/submission/` directory. It verifies hashes and sizes, preserves
+local edits, and returns a nonzero status on errors. Schedule that command with
+the computer's service manager for automatic retrieval while it is online.
+The cloud coding schedule is configured separately in the assistant; this MCP
+does not itself run coding agents. Owner instruction snapshots belong in the
+private state directory's `automation-context.json`, never in the clone.
