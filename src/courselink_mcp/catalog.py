@@ -1,3 +1,4 @@
+from copy import deepcopy
 import asyncio
 from html.parser import HTMLParser
 from urllib.parse import urlsplit, urljoin, unquote
@@ -91,7 +92,7 @@ class Catalog:
                            'url': self.browser.url(f'/d2l/home/{unit["Id"]}')})
         return result
 
-    async def content(self, course):
+    async def content(self, course, previous=None, toc_state=None):
         toc = await self.browser.get(self.browser.api('le', f'{course}/content/toc'))
         if not isinstance(toc.get('Modules'), list):
             raise ValueError('Unrecognized content table of contents.')
@@ -113,6 +114,17 @@ class Catalog:
 
         async def worker():
             for index, (kind, node, path) in pending:
+                identifier = f"module:{node['ModuleId']}" if kind == 'module' else node['TopicId']
+                key = f'{course}:content:{identifier}'
+                # Include the node and ancestor path: renaming/moving a parent may not
+                # change a child's timestamp, but must still update its stored metadata.
+                metadata = {'modified': node.get('LastModifiedDate'), 'node': deepcopy(node), 'path': path}
+                if toc_state is not None:
+                    toc_state[key] = metadata
+                cached = (previous or {}).get(key)
+                if metadata['modified'] is not None and cached and cached[0] == metadata:
+                    results[index] = cached[1]
+                    continue
                 if kind == 'module':
                     mid = node['ModuleId']
                     details = await self.browser.get(self.browser.api('le', f'{course}/content/modules/{mid}'))

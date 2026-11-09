@@ -54,6 +54,7 @@ Inspect one known item's metadata/URL | get_item
 Read source text/instructions | read_document; ZIP members need explicit archive_member. Never execute starter files.
 Search downloaded text | search_documents, then read_document before answering from snippets
 Saved file history, hashes, version IDs | list_file_versions
+Latest saved versions for a whole course | latest_versions
 Fetch/recheck a file on the service host | download_file
 Retrieve original saved bytes/diagrams | read_file (base64, using a version ID)
 Explicitly force a rescan/bypass cache | check_now(force_refresh=True), then poll courselink_status; otherwise check_now reads cached changes only
@@ -242,6 +243,11 @@ def register_tools(mcp, call):
         return await call('whats_new', {'since_cursor': since_cursor})
 
     @mcp.tool()
+    async def latest_versions(course_id: str) -> dict:
+        """Return the latest saved version per available course item in one cached lookup."""
+        return await call('latest_versions', {'course_id': course_id})
+
+    @mcp.tool()
     async def download_file(item_id: str) -> dict:
         """Fetch/recheck a known item's file on the service host, preserving replaced versions.
 
@@ -250,7 +256,7 @@ def register_tools(mcp, call):
 
     @mcp.tool()
     async def read_file(version_id: int, offset: int = 0, length: int = 65536) -> dict:
-        """Retrieve original saved bytes/diagrams by version ID as base64 (max 256 KiB/call); read_document extracts text."""
+        """Retrieve original saved bytes/diagrams by version ID as base64 (max 2 MiB/call); read_document extracts text."""
         return await call('read_file', dict(version_id=version_id, offset=offset, length=length))
 
     @mcp.tool()
@@ -429,6 +435,8 @@ class API:
                     'by_course': dict(Counter(row['course_id'] for row in changes)),
                     'freshness': page['freshness'], 'source': 'cache',
                     'note': 'Initial discovery is a baseline, not proof of new uploads. Save next_cursor for the next call.'}
+        if operation == 'latest_versions':
+            return {'versions': store.latest_versions(**args)}
         if operation == 'versions':
             return {'versions': store.versions(**args)}
         if operation == 'download':
@@ -450,8 +458,8 @@ class API:
         if operation == 'read_file':
             path = self.file_path(args['version_id'])
             offset, length = int(args.get('offset', 0)), int(args.get('length', 65536))
-            if offset < 0 or not 1 <= length <= 262144:
-                raise ValueError('Offset must be nonnegative; length must be 1..262144.')
+            if offset < 0 or not 1 <= length <= 2097152:
+                raise ValueError('Offset must be nonnegative; length must be 1..2097152.')
             with path.open('rb') as handle:
                 handle.seek(offset)
                 data = handle.read(length)
@@ -491,7 +499,7 @@ def create_app(config, service=None):
         try:
             operation = request.path_params['operation']
             if request.method == 'GET':
-                if operation not in {'status', 'health', 'courses', 'items', 'item', 'changes', 'versions', 'materials', 'search_documents', 'grades', 'submissions', 'submission_status', 'quizzes', 'quiz_status'}:
+                if operation not in {'status', 'health', 'courses', 'items', 'item', 'changes', 'versions', 'latest_versions', 'materials', 'search_documents', 'grades', 'submissions', 'submission_status', 'quizzes', 'quiz_status'}:
                     return JSONResponse({'error': 'Use POST for this operation.'}, 405)
                 args = dict(request.query_params)
                 if operation == 'grades' and 'refresh' in args:

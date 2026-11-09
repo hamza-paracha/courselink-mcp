@@ -96,3 +96,51 @@ def test_latest_version_query_is_bounded(tmp_path):
     assert not store.needs_download(row, 3600)
     assert any('LIMIT 1' in q for q in queries)
     store.close()
+
+
+def test_legacy_versions_migrate_without_losing_files(tmp_path):
+    import sqlite3
+    db = tmp_path / 'legacy.sqlite3'
+    with sqlite3.connect(db) as connection:
+        connection.execute('''CREATE TABLE versions(id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT NOT NULL,sha256 TEXT NOT NULL,path TEXT NOT NULL,
+            size INTEGER NOT NULL,downloaded_at TEXT NOT NULL)''')
+        connection.execute("INSERT INTO versions VALUES(1,'1:content:1','digest','saved.pdf',4,'2026-11-02')")
+    for _ in range(2):  # Migration is idempotent across restarts.
+        store = Store(db)
+        row = store.latest_version('1:content:1')
+        assert row['path'] == 'saved.pdf' and row['sha256'] == 'digest'
+        assert row['etag'] is None and row['last_modified'] is None
+        store.close()
+
+
+def test_search_indexes_track_updates_replacements_and_rebuild(tmp_path):
+    store = Store(tmp_path / 'search.sqlite3')
+    row = {'id': '1:content:1', 'course_id': '1', 'kind': 'content', 'title': 'Lab instructions'}
+    store.reconcile('1', 'content', [row])
+    source = tmp_path / 'temporary'
+    source.write_text('example')
+    version, _ = store.record_file(row, source, tmp_path / 'saved', 'digest', 7)
+    fts_enabled = store.fts
+    text = 'Lab instruction: "quoted" phrase, multiple\nlines and café.'
+    store.save_document(version['id'], {'text': text})
+    for query in ('instruction', 'Lab', 'ab', '"quoted"', 'multiple\nlines', 'café', 'missing', 'on: "'):
+        indexed = store.search_documents(query)['matches']
+        store.fts = False
+        fallback = store.search_documents(query)['matches']
+        store.fts = fts_enabled
+        assert indexed == fallback
+    store.save_document(version['id'], {'text': 'Replacement instructions'})
+    assert not store.search_documents('quoted')['matches']
+    assert store.search_documents('Replacement')['matches']
+    store.reconcile('1', 'content', [{**row, 'title': 'New title'}])
+    assert not store.items(query='Lab')['items']
+    assert store.items(query='New title')['items']
+    if store.fts:
+        store.db.execute('DROP TABLE documents_fts')
+        store.db.execute('DROP TABLE items_fts')
+    store.close()
+    store = Store(tmp_path / 'search.sqlite3')
+    assert store.search_documents('Replacement')['matches']
+    assert store.items(query='New title')['items']
+    store.close()

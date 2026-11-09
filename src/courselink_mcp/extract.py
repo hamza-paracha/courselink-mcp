@@ -167,18 +167,25 @@ def extract_bytes(data, filename, member=None):
     return result
 
 
-def main():
+def worker_limits():
     if sys.platform.startswith('linux'):
         import resource
         resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
-    path = Path(sys.argv[1])
+
+
+def extract_path(filename, member=None):
+    path = Path(filename)
     try:
         if path.stat().st_size > MAX_BYTES:
-            result = {'status': 'too_large_for_text', 'text': '', 'warning': 'Retrieve the original file.'}
-        else:
-            result = extract_bytes(path.read_bytes(), path.name, sys.argv[2] if len(sys.argv) > 2 else None)
+            return {'status': 'too_large_for_text', 'text': '', 'warning': 'Retrieve the original file.'}
+        return extract_bytes(path.read_bytes(), path.name, member)
     except Exception as exc:
-        result = {'status': 'extraction_error', 'text': '', 'warning': str(exc)[:300]}
+        return {'status': 'extraction_error', 'text': '', 'warning': str(exc)[:300]}
+
+
+def main():
+    worker_limits()
+    result = extract_path(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
     print(json.dumps(result))
 
 

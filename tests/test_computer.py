@@ -68,8 +68,9 @@ async def test_sync_paginates_all_content_and_saves_metadata(setup):
         if operation == 'items':
             offsets.append(args['offset'])
             return {'items': [item if args['offset'] == 0 else page], 'total': 2}
-        if operation == 'versions':
-            return {'versions': [version]}
+        if operation == 'latest_versions':
+            assert args == {'course_id': '1'}
+            return {'versions': {item['id']: version}}
         return await original_call(operation, args)
     computer.call = call
     result = await computer.sync(refresh=False)
@@ -87,8 +88,8 @@ async def test_missing_cached_file_is_reported(setup):
             return {'session': {'state': 'login_required'}, 'last_scan': {'complete': True}}
         if operation == 'items':
             return {'items': [item], 'total': 1}
-        if operation == 'versions':
-            return {'versions': []}
+        if operation == 'latest_versions':
+            return {'versions': {}}
     computer.call = call
     result = await computer.sync(refresh=False)
     assert not result['complete'] and len(result['errors']) == 2
@@ -160,8 +161,9 @@ async def test_fresh_sync_reuses_scan_downloads_and_reports_partial_coverage(set
             return {'queued': True}
         if operation == 'items':
             return {'items': [item], 'total': 1}
-        if operation == 'versions':
-            return {'versions': [version]}
+        if operation == 'latest_versions':
+            assert args == {'course_id': '1'}
+            return {'versions': {item['id']: version}}
         return await original_call(operation, args)
 
     async def no_wait(seconds):
@@ -174,6 +176,7 @@ async def test_fresh_sync_reuses_scan_downloads_and_reports_partial_coverage(set
     assert result['saved'] == 1
     assert calls.count('scan') == 1
     assert 'download' not in calls
+    assert calls.count('latest_versions') == 1 and 'versions' not in calls
     assert len(result['errors']) == (0 if scan_complete else 1)
     # A subsequent sync also avoids transferring unchanged bytes to this computer.
     calls.clear()
@@ -192,3 +195,19 @@ def test_registered_remote_tools_have_forwarding_operations():
                 return function
             return register
     register_tools(Registry(), None)
+
+
+async def test_hash_manifest_survives_restart_and_invalidates_local_edits(setup, monkeypatch):
+    computer, item, version = setup
+    saved = await computer.save(item, version)
+    path = Path(saved['path'])
+    assert computer.local_hash(path) == version['sha256']
+    other = Computer(computer.config, computer.call)
+    original = hashlib.file_digest
+    def forbidden(*args):
+        pytest.fail('Unchanged file should reuse persistent hash')
+    monkeypatch.setattr(hashlib, 'file_digest', forbidden)
+    assert other.local_hash(path) == version['sha256']
+    monkeypatch.setattr(hashlib, 'file_digest', original)
+    path.write_bytes(b'changed contents')  # same size as original
+    assert other.local_hash(path) != version['sha256']

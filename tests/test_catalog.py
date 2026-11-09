@@ -186,3 +186,37 @@ async def test_module_dates_and_instruction_changes_are_refetched_without_toc_ch
     assert first['start_date'] == '2026-10-01' and first['end_date'] == '2026-10-31'
     assert first['due_date'] == '2026-10-07' and second['due_date'] == '2026-10-08'
     assert second['description'] == 'Changed instructions' and len(calls) == 4
+
+
+async def test_content_cache_matches_full_fetch_and_refetches_changed_nodes():
+    toc = {'Modules': [{'ModuleId': 1, 'Title': 'Week', 'LastModifiedDate': 'module-toc',
+        'Topics': [{'TopicId': 2, 'Title': 'Instructions', 'LastModifiedDate': 'topic-toc'}]}]}
+    browser = FakeBrowser(toc)
+    calls = []
+    async def get(path):
+        calls.append(path)
+        return toc if path.endswith('/toc') else {
+            'Description': {'Text': 'Instructions'}, 'LastModifiedDate': 'detail-date'}
+    browser.get = get
+    catalog, stamps = Catalog(browser), {}
+    full = await catalog.content('1', toc_state=stamps)
+    previous = {row['id']: (stamps[row['id']], row) for row in full}
+    calls.clear()
+    assert await catalog.content('1', previous=previous) == full
+    assert len(calls) == 1
+    assert full[0]['modified_at'] == 'detail-date'
+    toc['Modules'][0]['Topics'][0]['LastModifiedDate'] = 'changed'
+    calls.clear()
+    changed = await catalog.content('1', previous=previous)
+    assert any(path.endswith('/topics/2') for path in calls)
+    assert changed == await catalog.content('1')
+    toc['Modules'][0]['Title'] = 'Renamed parent'
+    assert (await catalog.content('1', previous=previous))[1]['module'] == 'Renamed parent'
+
+
+async def test_content_without_timestamps_always_fetches_details():
+    browser = FakeBrowser({'Modules': [{'Title': 'Week', 'Topics': [{'TopicId': 2, 'Title': 'Page'}]}]})
+    catalog, stamps = Catalog(browser), {}
+    rows = await catalog.content('1', toc_state=stamps)
+    browser.response = {'Modules': [{'Title': 'Week', 'Topics': [{'TopicId': 2, 'Title': 'Changed'}]}]}
+    assert (await catalog.content('1', previous={rows[0]['id']: (stamps[rows[0]['id']], rows[0])}))[0]['title'] == 'Changed'

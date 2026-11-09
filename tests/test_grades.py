@@ -522,8 +522,7 @@ async def test_html_login_detection_does_not_reject_logout_links(tmp_path, body,
 
 
 @pytest.mark.parametrize('release', [
-    {'IsReleased': False}, {'IsHidden': True}, {'ReleasedDate': None},
-    {'ReleasedDate': ''}, {'DisplayedGrade': 'Not released'},
+    {'IsReleased': False}, {'IsHidden': True}, {'DisplayedGrade': 'Not released'},
 ])
 async def test_unreleased_scores_are_not_returned_or_cached(service, release):
     service.browser.data['values'][0].update(release)
@@ -647,3 +646,21 @@ async def test_final_in_grade_values_is_not_lost_if_final_endpoint_unavailable()
     result = await fetch_grades(browser, '123')
     assert result['final_adjusted_grade']['percent'] == 90
     assert all(r['id'] != '999' for r in result['items'])
+
+
+@pytest.mark.parametrize('release_date', [None, ''])
+async def test_individual_score_with_empty_release_date_is_returned_and_cached(service, release_date):
+    service.browser.data['values'][0]['ReleasedDate'] = release_date
+    row = (await service.get_grades('123'))['courses'][0]['items'][0]
+    assert row['points_earned'] == 8
+    assert row['percent'] == 80
+    assert service.store.grades('123')['items'][0]['points_earned'] == 8
+
+
+@pytest.mark.parametrize('grade_type', [7, 8])
+@pytest.mark.parametrize('release_date', [None, ''])
+def test_final_score_with_empty_release_date_remains_hidden(grade_type, release_date):
+    row = normalize({'GradeObjectType': grade_type, 'ReleasedDate': release_date,
+                     'PointsNumerator': 8, 'PointsDenominator': 10})
+    assert row['flags']['hidden_or_unreleased'] is True
+    assert row['points_earned'] is None

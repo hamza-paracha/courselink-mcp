@@ -61,7 +61,7 @@ async def test_partial_failure_does_not_delete_cached_items(setup):
     previous = {'id': '1:assignment:2', 'course_id': '1', 'kind': 'assignment', 'title': 'Keep me'}
     service.store.reconcile('1', 'assignment', [previous])
     async def courses(): return [{'id': '1'}]
-    async def empty(course): return []
+    async def empty(course, **kwargs): return []
     async def fail(course): raise RuntimeError('unavailable')
     service.catalog.courses = courses
     service.catalog.content = empty
@@ -90,7 +90,7 @@ async def test_course_configuration_applies_on_next_scan_without_restart(setup):
     config, service = setup
     (config.state / 'config.json').write_text(json.dumps({'courses': {'2': 'second-course'}}))
     async def courses(): return [{'id': '2'}]
-    async def empty(course):
+    async def empty(course, **kwargs):
         assert course == '2'
         return []
     service.catalog.courses = courses
@@ -239,7 +239,7 @@ async def test_parent_failure_preserves_links_and_reports_stale_cache(setup):
     checked = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
     service.store.set_state('last_successful_scan', {'complete': True, 'finished_at': checked})
     async def courses(): return [{'id': '1'}]
-    async def empty(course): return []
+    async def empty(course, **kwargs): return []
     async def fail(course): raise RuntimeError('Synthetic section outage')
     service.catalog.courses = courses
     for name in ('content', 'assignments', 'announcements', 'calendar', 'quizzes'):

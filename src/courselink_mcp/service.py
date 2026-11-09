@@ -1,4 +1,6 @@
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 from collections import deque
 from weakref import WeakValueDictionary
 from contextlib import contextmanager, suppress
@@ -9,7 +11,6 @@ import logging
 from pathlib import Path
 import tempfile
 import json
-import sys
 import time
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -19,7 +20,7 @@ from .browser import BrowserSession, LoginRequired, RateLimited
 from .catalog import Catalog, linked_files
 from .store import Store, now, safe_name
 from .grades import fetch_grades, grade_error, has_grade
-from .extract import EXTRACTOR_VERSION
+from .extract import EXTRACTOR_VERSION, extract_path, worker_limits
 from .submissions import Submissions, background_monitor
 from .quizzes import Quizzes
 
@@ -42,6 +43,7 @@ class Service:
         self.tasks = []
         self.ready = asyncio.Event()
         self.extract_lock = asyncio.Lock()
+        self.extract_pool = None
         self.heartbeats = {}
         self.verify_files_requested = False
         self.submissions = Submissions(self)
@@ -152,6 +154,7 @@ class Service:
                 if self.download_client:
                     await self.download_client.aclose()
             finally:
+                self.stop_extract_pool()
                 self.store.close()
 
     async def session_loop(self):
@@ -231,6 +234,23 @@ class Service:
         return {'queued': True, 'verify_files': self.verify_files_requested,
                 'session': self.browser.status, 'already_scanning': self.scan_lock.locked()}
 
+    def stop_extract_pool(self):
+        pool, self.extract_pool = self.extract_pool, None
+        if pool is None:
+            return
+        if hasattr(pool, 'kill_workers'):
+            pool.kill_workers()
+        else:
+            # Python 3.11–3.13 lack the public kill_workers API. Capture workers
+            # before shutdown clears the mapping, then kill and reap hung parsers.
+            processes = list(pool._processes.values())
+            pool.shutdown(wait=False, cancel_futures=True)
+            for process in processes:
+                if process.is_alive():
+                    process.kill()
+            for process in processes:
+                process.join(timeout=1)
+
     async def extract_document(self, version, member=None):
         # A cached read must not queue behind an unrelated slow parser.
         cached = self.store.document(version['id']) if member is None else None
@@ -240,24 +260,21 @@ class Service:
             cached = self.store.document(version['id']) if member is None else None
             if cached is not None and cached.get('extractor_version') == EXTRACTOR_VERSION:
                 return cached
-            args = [sys.executable, '-m', 'courselink_mcp.extract', version['path']]
-            if member is not None:
-                args.append(member)
-            proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
-                                                         stderr=asyncio.subprocess.DEVNULL)
+            if self.extract_pool is None:
+                self.extract_pool = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=25,
+                    mp_context=multiprocessing.get_context('spawn'), initializer=worker_limits)
             try:
-                out, _ = await asyncio.wait_for(proc.communicate(), 30)
-                result = json.loads(out) if proc.returncode == 0 else {
-                    'status': 'extraction_error', 'text': '', 'warning': 'Document extraction exceeded limits or failed.'}
+                result = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
+                    self.extract_pool, extract_path, version['path'], member), 30)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+                self.stop_extract_pool()
                 result = {'status': 'extraction_timeout', 'text': '', 'warning': 'Retrieve the original file for inspection.'}
-            except BaseException:
-                if proc.returncode is None:
-                    proc.kill()
-                    await proc.wait()
+            except asyncio.CancelledError:
+                self.stop_extract_pool()
                 raise
+            except Exception:
+                self.stop_extract_pool()
+                result = {'status': 'extraction_error', 'text': '', 'warning': 'Document extraction exceeded limits or failed.'}
             if member is None:
                 result['extractor_version'] = EXTRACTOR_VERSION
                 self.store.save_document(version['id'], result)
@@ -272,7 +289,7 @@ class Service:
                 for version in pending:
                     await self.extract_document(version)
                     self.heartbeats['index'] = time.monotonic()
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0)
                 if pending:
                     delay = 0  # Keep draining a backlog; idle polling still sleeps.
             except Exception as exc:
@@ -299,44 +316,14 @@ class Service:
                     course['folder'] = self.config.courses.get(course['id'])
                 self.store.save_courses(courses)
                 enrolled = {course['id'] for course in courses}
+                tasks = []
                 for course in self.config.courses:
                     if course not in enrolled:
                         report['errors'].append({'course': course, 'section': 'enrollment',
                                                  'message': 'Configured course not present in current enrollments.'})
-                        continue
-                    report['courses'][course] = {}
-                    pending = []
-                    parents_complete = True
-                    for kind, fetch in [('content', self.catalog.content), ('assignment', self.catalog.assignments),
-                                        ('announcement', self.catalog.announcements), ('event', self.catalog.calendar),
-                                        ('quiz', self.catalog.quizzes)]:
-                        try:
-                            with self.phase(report, kind):
-                                rows = await fetch(course)
-                                self.store.reconcile(course, kind, rows)
-                            report['courses'][course][kind] = len(rows)
-                            pending.extend(rows)
-                            await asyncio.sleep(0)
-                        except (LoginRequired, RateLimited):
-                            raise
-                        except Exception as exc:
-                            parents_complete = False
-                            report['errors'].append({'course': course, 'section': kind, 'message': str(exc)[:250]})
-                    errors_before_downloads = len(report['errors'])
-                    with self.phase(report, 'downloads'):
-                        await self.download_rows(course, pending, report, verify_files=verify_files)
-                    parents_complete = parents_complete and len(report['errors']) == errors_before_downloads
-                    try:
-                        with self.phase(report, 'linked_files'):
-                            linked_count, saved, errors = await self.scan_linked_files(course,
-                                verify_files=verify_files, parents_complete=parents_complete)
-                        report['courses'][course]['linked_file'] = linked_count
-                        report['files_saved'] += saved
-                        report['errors'].extend(errors)
-                    except (LoginRequired, RateLimited):
-                        raise
-                    except Exception as exc:
-                        report['errors'].append({'course': course, 'section': 'linked_file', 'message': str(exc)[:250]})
+                    else:
+                        tasks.append(self.scan_course(course, report, verify_files))
+                await self.gather_cancel(tasks)
             except asyncio.CancelledError:
                 report['errors'].append({'section': 'scan', 'message': 'Scan interrupted or exceeded its time limit.'})
                 raise
@@ -360,6 +347,74 @@ class Service:
             self.store.set_state('last_error', None)
             return report
 
+    @staticmethod
+    async def gather_cancel(coroutines):
+        tasks = [asyncio.create_task(coro) for coro in coroutines]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    async def scan_course(self, course, report, verify_files=False):
+        counts = report['courses'][course] = {}
+        local = {'errors': [], 'files_saved': 0}
+        pending = []
+
+        async def section(kind, fetch):
+            try:
+                with self.phase(report, kind):
+                    toc_state = {}
+                    if kind == 'content':
+                        cached = self.store.get_state(f'content_toc:{course}', {})
+                        refreshed = self.store.get_state(f'content_refreshed:{course}')
+                        full = (verify_files or not refreshed or
+                            (datetime.now(timezone.utc) - datetime.fromisoformat(refreshed)).total_seconds()
+                            >= self.config.file_check_seconds)
+                        previous = {} if full else {
+                            row['id']: (cached.get(row['id']), json.loads(row['data']))
+                            for row in self.store.db.execute(
+                                'SELECT id,data FROM items WHERE course_id=? AND kind=? AND available=1',
+                                (course, 'content'))}
+                        rows = await fetch(course, previous=previous, toc_state=toc_state)
+                    else:
+                        rows = await fetch(course)
+                    self.store.reconcile(course, kind, rows)
+                    if kind == 'content':
+                        self.store.set_state(f'content_toc:{course}', toc_state)
+                        if full:
+                            self.store.set_state(f'content_refreshed:{course}', now())
+                counts[kind] = len(rows)
+                pending.extend(rows)
+            except (LoginRequired, RateLimited):
+                raise
+            except Exception as exc:
+                local['errors'].append({'course': course, 'section': kind, 'message': str(exc)[:250]})
+
+        try:
+            await self.gather_cancel(section(kind, fetch) for kind, fetch in [
+                ('content', self.catalog.content), ('assignment', self.catalog.assignments),
+                ('announcement', self.catalog.announcements), ('event', self.catalog.calendar),
+                ('quiz', self.catalog.quizzes)])
+            with self.phase(report, 'downloads'):
+                await self.download_rows(course, pending, local, verify_files=verify_files)
+            try:
+                with self.phase(report, 'linked_files'):
+                    count, saved, errors = await self.scan_linked_files(course,
+                        verify_files=verify_files, parents_complete=not local['errors'])
+                counts['linked_file'] = count
+                local['files_saved'] += saved
+                local['errors'].extend(errors)
+            except (LoginRequired, RateLimited):
+                raise
+            except Exception as exc:
+                local['errors'].append({'course': course, 'section': 'linked_file', 'message': str(exc)[:250]})
+        finally:
+            report['files_saved'] += local['files_saved']
+            report['errors'].extend(local['errors'])
+
     async def scan_linked_files(self, course, verify_files=False, parents_complete=True):
         rows = self.store.db.execute('SELECT id FROM items WHERE course_id=? AND available=1 AND kind!=?',
                                      (course, 'linked_file')).fetchall()
@@ -368,50 +423,48 @@ class Service:
         errors = [] if parents_complete else [{'course': course, 'section': 'linked_file',
             'message': 'Parent metadata or files are incomplete; preserving previously discovered links.'}]
         while queue:
-            parent = queue.popleft()
-            if parent['id'] in visited:
-                continue
-            visited.add(parent['id'])
-            if len(visited) > 2000:
-                raise ValueError('Too many linked course pages; leaving the previous link index intact.')
-            documents = []
-            for field in ('body', 'instructions'):
-                raw = parent.get(field)
-                if isinstance(raw, dict) and raw.get('Html'):
-                    documents.append(raw['Html'])
-            # Link attachments can point at a file without being in the formal attachment list.
-            if parent.get('links'):
-                from html import escape
-                documents.append(''.join('<a href="' + escape(link.get('Href', ''), quote=True) + '">file</a>'
-                                         for link in parent['links']))
-            if (parent.get('filename') or '').lower().endswith(('.html', '.htm')):
-                versions = self.store.versions(parent['id'])
-                if not versions:
-                    errors.append({'course': course, 'item': parent['id'], 'section': 'linked_file',
-                                   'message': 'HTML page unavailable; link coverage is incomplete.'})
-                else:
-                    try:
-                        documents.append(Path(versions[0]['path']).read_text(errors='replace'))
-                    except OSError as exc:
+            children = []
+            for _ in range(len(queue)):
+                parent = queue.popleft()
+                if parent['id'] in visited:
+                    continue
+                visited.add(parent['id'])
+                if len(visited) > 2000:
+                    raise ValueError('Too many linked course pages; leaving the previous link index intact.')
+                documents = []
+                for field in ('body', 'instructions'):
+                    raw = parent.get(field)
+                    if isinstance(raw, dict) and raw.get('Html'):
+                        documents.append(raw['Html'])
+                # Link attachments can point at a file without being in the formal attachment list.
+                if parent.get('links'):
+                    from html import escape
+                    documents.append(''.join('<a href="' + escape(link.get('Href', ''), quote=True) + '">file</a>'
+                                             for link in parent['links']))
+                if (parent.get('filename') or '').lower().endswith(('.html', '.htm')):
+                    versions = self.store.versions(parent['id'])
+                    if not versions:
                         errors.append({'course': course, 'item': parent['id'], 'section': 'linked_file',
-                                       'message': type(exc).__name__})
-            for document in documents:
-                for child in linked_files(parent, document, self.browser):
-                    if child['id'] in found:
-                        continue
-                    found[child['id']] = child
-                    # Reconcile only the full set at the end; incremental upserts must not hide other links.
-                    self.store.upsert_link(child)
-                    try:
-                        if verify_files or self.store.needs_download(child, self.config.file_check_seconds):
-                            result = await self.download(child['id'])
-                            saved += int(result['new_version'])
-                    except (LoginRequired, RateLimited):
-                        raise
-                    except Exception as exc:
-                        errors.append({'course': course, 'item': child['id'], 'section': 'linked_file',
-                                       'message': str(exc)[:250]})
-                    queue.append(child)
+                                       'message': 'HTML page unavailable; link coverage is incomplete.'})
+                    else:
+                        try:
+                            documents.append(Path(versions[0]['path']).read_text(errors='replace'))
+                        except OSError as exc:
+                            errors.append({'course': course, 'item': parent['id'], 'section': 'linked_file',
+                                           'message': type(exc).__name__})
+                for document in documents:
+                    for child in linked_files(parent, document, self.browser):
+                        if child['id'] in found:
+                            continue
+                        found[child['id']] = child
+                        # Reconcile only the full set at the end; incremental upserts must not hide other links.
+                        self.store.upsert_link(child)
+                        children.append(child)
+                        queue.append(child)
+            batch = {'files_saved': 0, 'errors': []}
+            await self.download_rows(course, children, batch, verify_files=verify_files)
+            saved += batch['files_saved']
+            errors.extend({**error, 'section': 'linked_file'} for error in batch['errors'])
         self.store.reconcile(course, 'linked_file', list(found.values()), mark_missing=not errors)
         return len(found), saved, errors
 
@@ -422,7 +475,7 @@ class Service:
         async def worker():
             for row in pending:
                 try:
-                    result = await self.download(row['id'])
+                    result = await self.download(row['id'], verify_files=verify_files)
                     report['files_saved'] += int(result['new_version'])
                 except (LoginRequired, RateLimited):
                     raise
@@ -438,16 +491,16 @@ class Service:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
-    async def download(self, item_id):
+    async def download(self, item_id, verify_files=True):
         lock = self.download_locks.setdefault(item_id, asyncio.Lock())
         async with lock, self.download_slots:
             self.active_downloads += 1
             try:
-                return await self._download(item_id)
+                return await self._download(item_id, verify_files=verify_files)
             finally:
                 self.active_downloads -= 1
 
-    async def _download(self, item_id):
+    async def _download(self, item_id, verify_files=True):
         row = self.store.get(item_id)
         if not row['available'] or not row.get('download_path'):
             raise ValueError('This item does not have a currently available downloadable file.')
@@ -476,6 +529,7 @@ class Service:
                     fallback = candidate
             except ValueError:
                 pass
+        latest = self.store.latest_version(item_id)
         temp = None
         try:
             if self.download_client is None:
@@ -487,7 +541,22 @@ class Service:
                 await self.browser.wait_for_cooldown()
                 cookies = await self.browser.cookies()
                 cookie_header = httpx.Request('GET', url, cookies=cookies).headers.get('cookie', '')
-                async with client.stream('GET', url, headers={'Cache-Control': 'no-cache', 'Cookie': cookie_header}) as response:
+                headers = {'Cookie': cookie_header}
+                conditional = (not verify_files and latest and latest.get('validator_url') == url
+                               and Path(latest['path']).is_file())
+                if conditional:
+                    if latest.get('etag'):
+                        headers['If-None-Match'] = latest['etag']
+                    if latest.get('last_modified'):
+                        headers['If-Modified-Since'] = latest['last_modified']
+                if verify_files:
+                    headers['Cache-Control'] = 'no-cache'
+                async with client.stream('GET', url, headers=headers) as response:
+                    if response.status_code == 304:
+                        if not conditional or not any(key.startswith('If-') for key in headers):
+                            raise ValueError('Unexpected not-modified response without a cached validator.')
+                        self.store.file_checked(row)
+                        return {'item_id': item_id, 'new_version': False, 'version': latest}
                     if response.status_code == 404 and fallback and urlsplit(url).path.startswith('/d2l/api/'):
                         url, fallback = fallback, None
                         continue
@@ -529,6 +598,9 @@ class Service:
                     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
                     destination = item_folder / f'{stamp}-{hexdigest[:12]}-{filename}'
                     version, changed = self.store.record_file(row, temp, destination, hexdigest, size)
+                    self.store.file_validators(version['id'], response.headers.get('etag'),
+                                               response.headers.get('last-modified'), url)
+                    version = self.store.latest_version(item_id)
                     self.store.file_checked(row)
                     return {'item_id': item_id, 'new_version': changed, 'version': version}
             raise RuntimeError('Too many redirects for a CourseLink file.')

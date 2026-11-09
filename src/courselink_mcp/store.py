@@ -25,6 +25,7 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA recursive_triggers=ON')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS courses(id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -46,6 +47,56 @@ class Store:
             CREATE INDEX IF NOT EXISTS items_course_kind ON items(course_id,kind,available);
             CREATE INDEX IF NOT EXISTS changes_course ON changes(course_id,id);
         ''')
+
+        columns = {row['name'] for row in self.db.execute('PRAGMA table_info(versions)')}
+        with self.db:
+            for column in ('etag', 'last_modified', 'validator_url'):
+                if column not in columns:
+                    self.db.execute(f'ALTER TABLE versions ADD COLUMN {column} TEXT')
+
+        self.fts = False
+        try:
+            with self.db:
+                for table, key, fields in [('documents', 'version_id', ['text']),
+                                            ('items', 'rowid', ['title', 'data'])]:
+                    index = table + '_fts'
+                    exists = self.db.execute('SELECT 1 FROM sqlite_master WHERE name=?', (index,)).fetchone()
+                    columns = ','.join(fields)
+                    self.db.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS {index} USING fts5("
+                                    f"{columns},content='{table}',content_rowid='{key}',tokenize='trigram')")
+                    old = ','.join('old.' + field for field in fields)
+                    new = ','.join('new.' + field for field in fields)
+                    # executescript commits implicitly; individual trigger statements
+                    # keep creation and the initial rebuild in the same transaction.
+                    self.db.execute(f"""CREATE TRIGGER IF NOT EXISTS {index}_insert AFTER INSERT ON {table}
+                        BEGIN INSERT INTO {index}(rowid,{columns}) VALUES(new.{key},{new}); END""")
+                    self.db.execute(f"""CREATE TRIGGER IF NOT EXISTS {index}_delete AFTER DELETE ON {table}
+                        BEGIN INSERT INTO {index}({index},rowid,{columns}) VALUES('delete',old.{key},{old}); END""")
+                    self.db.execute(f"""CREATE TRIGGER IF NOT EXISTS {index}_update AFTER UPDATE ON {table}
+                        BEGIN INSERT INTO {index}({index},rowid,{columns}) VALUES('delete',old.{key},{old});
+                        INSERT INTO {index}(rowid,{columns}) VALUES(new.{key},{new}); END""")
+                    if not exists:
+                        self.db.execute(f"INSERT INTO {index}({index}) VALUES('rebuild')")
+            self.fts = True
+        except sqlite3.OperationalError:
+            # FTS5/trigram is optional in system SQLite builds.
+            pass
+
+    def fts_query(self, query):
+        if self.fts and len(query) >= 3 and query.isascii() and '\x00' not in query:
+            return '"' + query.replace('"', '""') + '"'
+        return None
+
+    def latest_versions(self, course_id):
+        return {row['item_id']: dict(row) for row in self.db.execute(
+            """SELECT v.* FROM versions v JOIN items i ON i.id=v.item_id
+               WHERE i.course_id=? AND i.available=1
+               AND v.id=(SELECT max(id) FROM versions WHERE item_id=i.id)""", (course_id,))}
+
+    def file_validators(self, version_id, etag, last_modified, url):
+        with self.db:
+            self.db.execute('UPDATE versions SET etag=?,last_modified=?,validator_url=? WHERE id=?',
+                            (etag, last_modified, url, version_id))
 
     def close(self):
         self.db.close()
@@ -128,6 +179,10 @@ class Store:
                 clauses.append(field + '=?')
                 params.append(value)
         if query:
+            fts_query = self.fts_query(query)
+            if fts_query:
+                clauses.append('rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)')
+                params.append(fts_query)
             clauses.append('(instr(lower(title),lower(?))>0 OR instr(lower(data),lower(?))>0)')
             params.extend([query, query])
         if category:
@@ -173,7 +228,14 @@ class Store:
         if course_id:
             sql += ' AND i.course_id=?'
             params.append(course_id)
-        sql += ' ORDER BY i.course_id,i.title LIMIT ?'
+        fts_query = self.fts_query(query)
+        if fts_query:
+            sql += ' AND d.version_id IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?)'
+            params.append(fts_query)
+            sql += ' ORDER BY (SELECT rank FROM documents_fts WHERE documents_fts MATCH ? AND rowid=d.version_id),i.course_id,i.title LIMIT ?'
+            params.append(fts_query)
+        else:
+            sql += ' ORDER BY i.course_id,i.title LIMIT ?'
         params.append(min(max(limit, 1), 100))
         results = []
         for row in self.db.execute(sql, params):

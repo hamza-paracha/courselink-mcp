@@ -215,7 +215,7 @@ async def test_full_scan_reports_link_failure_without_losing_successful_files(do
     parent = dict(row, download_path=None, instructions={'Html':
         '<a href="/content/unavailable.pdf">Missing</a><a href="/content/available.pdf">Available</a>'})
     async def courses(): return [{'id': '1'}]
-    async def content(course): return [parent]
+    async def content(course, **kwargs): return [parent]
     async def empty(course): return []
     service.catalog.courses = courses
     service.catalog.content = content
@@ -303,3 +303,50 @@ async def test_failed_parent_html_refresh_keeps_previous_link_index(download_ser
     report = await service.scan(verify_files=True)
     assert not report['complete'] and service.store.get(old['id'])['available']
     assert any('Parent metadata or files' in e['message'] for e in report['errors'])
+
+
+async def test_conditional_recheck_and_forced_bytes(download_service):
+    service, row, mock = download_service
+    requests = []
+    def handler(request):
+        requests.append(request)
+        if request.headers.get('if-none-match') == '"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, content=b'%PDF-example', headers={
+            'content-type': 'application/pdf', 'etag': '"v1"',
+            'last-modified': 'Mon, 02 Nov 2026 12:00:00 GMT'})
+    mock(handler)
+    first = await service.download(row['id'])
+    same = await service.download(row['id'], verify_files=False)
+    assert not same['new_version'] and same['version']['id'] == first['version']['id']
+    assert requests[-1].headers['if-modified-since'] == 'Mon, 02 Nov 2026 12:00:00 GMT'
+    assert 'cache-control' not in requests[-1].headers
+    await service.download(row['id'], verify_files=True)
+    assert 'if-none-match' not in requests[-1].headers
+    assert len(service.store.versions(row['id'])) == 1
+    assert not list(service.config.school.rglob('*.partial'))
+    Path(first['version']['path']).unlink()
+    await service.download(row['id'], verify_files=False)
+    assert 'if-none-match' not in requests[-1].headers
+
+
+async def test_linked_html_rounds_are_concurrent_and_discover_descendants(download_service):
+    import asyncio
+    service, row, mock = download_service
+    service.store.reconcile('1', 'content', [dict(row, download_path=None, instructions={'Html':
+        '<a href="/content/a.html">A</a><a href="/content/b.html">B</a>'})])
+    active = peak = 0
+    async def handler(request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.01)
+            if request.url.path.endswith('.html'):
+                return httpx.Response(200, text='<a href="/content/child.txt">Child</a>', headers={'content-type': 'text/html'})
+            return httpx.Response(200, content=b'child')
+        finally:
+            active -= 1
+    mock(handler)
+    count, saved, errors = await service.scan_linked_files('1')
+    assert count == saved == 3 and not errors and peak == 2

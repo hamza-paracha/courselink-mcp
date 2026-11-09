@@ -21,7 +21,7 @@ from .store import safe_name
 
 OPERATIONS = dict(status='courselink_status', courses='list_courses', items='list_items',
     item='get_item', materials='list_materials', document='read_document',
-    search_documents='search_documents', changes='list_changes', versions='list_file_versions',
+    search_documents='search_documents', changes='list_changes', versions='list_file_versions', latest_versions='latest_versions',
     download='download_file', read_file='read_file', scan='check_now', login='open_login',
     grades='get_grades', submissions='list_submissions', submission_status='submission_status',
     submit_to_dropbox='submit_to_dropbox', quizzes='list_quizzes', quiz_status='quiz_status',
@@ -78,6 +78,29 @@ class Computer:
     def __init__(self, config, call):
         self.config, self.call = config, call
         self.lock = asyncio.Lock()
+        self.hash_manifest_path = config.state / 'computer-hashes.json'
+        try:
+            self.hash_manifest = json.loads(self.hash_manifest_path.read_text())
+            if not isinstance(self.hash_manifest, dict):
+                self.hash_manifest = {}
+        except (OSError, ValueError):
+            self.hash_manifest = {}
+
+    def local_hash(self, path):
+        stamp = path.stat()
+        # ctime also detects local writes that restore an old mtime.
+        signature = [stamp.st_size, stamp.st_mtime_ns, stamp.st_ctime_ns, stamp.st_ino]
+        entry = self.hash_manifest.get(str(path), {})
+        if entry.get('signature') == signature:
+            return entry['sha256']
+        with path.open('rb') as handle:
+            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+        after = path.stat()
+        if [after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino] != signature:
+            raise ValueError('Local file changed while hashing; retry the sync.')
+        self.hash_manifest[str(path)] = {'signature': signature, 'sha256': digest}
+        write_json(self.hash_manifest_path, self.hash_manifest)
+        return digest
 
     def root(self, course):
         folder = self.config.courses.get(str(course))
@@ -178,8 +201,7 @@ class Computer:
             if existing.is_file() and not existing.is_symlink() and not existing.name.endswith('.partial'):
                 if existing.stat().st_size != size:
                     continue
-                with existing.open('rb') as handle:
-                    matches = hashlib.file_digest(handle, 'sha256').hexdigest() == digest
+                matches = self.local_hash(existing) == digest
                 if matches:
                     return {'item_id': item['id'], 'path': str(existing), 'sha256': digest,
                             'size': size, 'saved': False, 'version_id': version['id']}
@@ -196,7 +218,7 @@ class Computer:
                 temporary = Path(handle.name)
                 while True:
                     chunk = await self.call('read_file', {'version_id': version['id'],
-                                                       'offset': offset, 'length': 262144})
+                                                       'offset': offset, 'length': 2097152})
                     data = base64.b64decode(chunk['base64'], validate=True)
                     if chunk['offset'] != offset or chunk['next_offset'] != offset + len(data):
                         raise ValueError('Invalid transfer offset.')
@@ -246,8 +268,10 @@ class Computer:
             before = status.get('last_scan')
             await self.call('scan', {})
             deadline = asyncio.get_running_loop().time() + 240
+            polls = 0
             while asyncio.get_running_loop().time() < deadline:
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5 if polls < 10 else 2)
+                polls += 1
                 status = await self.call('status', {})
                 if not status['scanning'] and status.get('last_scan') != before:
                     break
@@ -272,16 +296,17 @@ class Computer:
             # Pages, links, dates and instructions are saved too, even without a file attachment.
             write_json(root / 'catalog.json', {'course_id': course, 'synced_at': report['started_at'],
                        'last_scan': status.get('last_scan'), 'items': items})
+            latest = (await self.call('latest_versions', {'course_id': course}))['versions']
             for item in items:
                 if not item.get('download_path'):
                     continue
                 try:
                     # The scan already downloads new, changed, and due files. Reuse its
                     # versions instead of forcing every file over the network again.
-                    versions = (await self.call('versions', {'item_id': item['id']}))['versions']
-                    if not versions:
+                    version = latest.get(item['id'])
+                    if not version:
                         raise ValueError('No cached file version; check remote scan errors.')
-                    report['files'].append(await self.save(item, versions[0]))
+                    report['files'].append(await self.save(item, version))
                 except Exception as exc:
                     report['errors'].append({'item_id': item['id'], 'message': str(exc)[:400]})
         report.update(finished_at=datetime.now(timezone.utc).isoformat(),

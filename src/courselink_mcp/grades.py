@@ -73,7 +73,10 @@ def normalize(value, obj=None, category=None):
         excluded = True
     hidden = flag(value, 'IsHidden')
     if (obj.get('IsHidden') is True or value.get('IsReleased') is False
-            or ('ReleasedDate' in value and not value['ReleasedDate'])
+            # ReleasedDate is meaningful for final grades; individual learner
+            # values can contain a visible score with a null release date.
+            or (value.get('GradeObjectType') in (7, 8)
+                and 'ReleasedDate' in value and not value['ReleasedDate'])
             or (display or '').lower() in ('not released', 'unreleased')
             or (earned is None and weighted is None and display in (None, '-', '–'))):
         hidden = True
