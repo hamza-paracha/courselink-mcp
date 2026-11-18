@@ -59,5 +59,3 @@ An authenticated coding assistant can read owner-provided instructions and the i
 On an already configured computer bridge, `courselink sync-results` downloads these ZIPs into the mapped course’s `CourseLink Downloads/labs/labN/submission/` or `CourseLink Downloads/assignments/aN/submission/` directory. It verifies hashes and sizes, preserves local edits, and returns a nonzero status on errors. Schedule that command with the computer’s service manager for automatic retrieval while it is online.
 
 The cloud coding schedule is configured separately in the assistant; this MCP does not itself run coding agents. Owner instruction snapshots belong in the private state directory’s `automation-context.json`, never in the clone.
-
-made by [@CourseLink MCP contributors](https://example.invalid/courselink).
