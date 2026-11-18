@@ -4,7 +4,7 @@ For agent-assisted setup, ask your coding agent to follow [AGENTS.md](../AGENTS.
 
 Monitor University of Guelph CourseLink, keep versioned downloads, and search course materials through an MCP client. Run it on your own Mac or Linux machine and sign in with your own account in a dedicated browser window.
 
-The monitor indexes accessible content, assignment instructions, announcements, calendar events, and quiz metadata. It preserves file revisions, records changes, and extracts text from PDFs, Office documents, text files, and ZIP members. Background monitoring does not submit assignments or start quizzes. Explicit uploads use the separate confirmation workflow in [Submission history and uploads](submissions.md).
+The monitor indexes accessible content, assignment instructions, announcements, calendar events, and quiz metadata. It preserves file revisions, records changes, and extracts text from PDFs, Office documents, text files, and ZIP members. CourseLink access is read-only.
 
 ## Quick start
 
@@ -114,11 +114,11 @@ uv run courselink grades --course example-course --refresh --json
 
 Use `list_changes(after=cursor)` to read cached updates. Follow `has_more` and save the returned `next_cursor` between polls. The initial discovery is a baseline. Report the last successful check and incomplete coverage.
 
-### Quiz status, submission history and explicit uploads
+### Quiz status and submission history
 
 See [Quiz attempt tracking](quizzes.md) for read-only quiz schemas, coverage and score freshness.
 
-See [Submission history and uploads](submissions.md) for complete argument schemas, responses, HTTP routes, confirmation rules, audit logging and offline verification limitations. No existing tool arguments have changed.
+See [Submission history](submissions.md) for filename and folder search, HTTP routes, and coverage limits.
 
 ## Use CourseLink in Claude chat
 
@@ -203,6 +203,10 @@ uv run courselink sync
 `courselink computer-stdio` exposes the usual remote tools plus `download_to_computer`, `sync_to_computer`, and `computer_sync_status`. Use that subcommand in your local MCP client configuration and supply the same environment variables. Transfers verify SHA-256 and preserve locally edited files. Server details have no built-in defaults.
 
 For a remote MCP connection, run the server's `courselink stdio` over SSH. Supply your own SSH host, executable path, and `COURSELINK_STATE_DIR`; keep those details in your private client configuration. The bridge uses the token on the server. File paths returned by tools refer to the service host; use `read_file` to retrieve saved bytes.
+
+### Completed-work mailbox
+
+An authenticated coding assistant can save requested ZIP deliverables with `save_completed_work`, source item IDs, and a verification report. ZIPs are immutable and limited to 6 MiB. With the Mac bridge configured, run `uv run courselink sync-results` to verify and copy them into the mapped course’s download folder.
 
 ## HTTP API
 
