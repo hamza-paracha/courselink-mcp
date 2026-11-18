@@ -21,7 +21,7 @@ from .catalog import Catalog, linked_files
 from .store import Store, now, safe_name
 from .grades import fetch_grades, grade_error, has_grade
 from .extract import EXTRACTOR_VERSION, extract_path, worker_limits
-from .submissions import Submissions, background_monitor
+from .submissions import Submissions
 from .quizzes import Quizzes
 
 log = logging.getLogger(__name__)
@@ -131,15 +131,8 @@ class Service:
 
     async def start(self):
         self.heartbeats = {name: time.monotonic() for name in ('session', 'scan', 'index')}
-        self.tasks = [asyncio.create_task(self.run_worker(worker)) for worker in
+        self.tasks = [asyncio.create_task(worker()) for worker in
                       (self.session_loop, self.scan_loop, self.index_loop)]
-
-    async def run_worker(self, worker):
-        token = background_monitor.set(True)
-        try:
-            await worker()
-        finally:
-            background_monitor.reset(token)
 
     async def close(self):
         for task in self.tasks:

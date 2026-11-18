@@ -18,10 +18,10 @@ Grades, quiz attempts, submission history, deadlines, and saved deliverables are
 | “Find the instructions for my next lab.” | Assignment and lab pages, downloaded documents, and searchable source text |
 
 - **Read your actual grades.** `get_grades` reads the learner gradebook for one or all monitored courses. Unknown and unreleased scores stay unknown; they are never treated as zero. Results report when grades were checked and any coverage gaps.
-- **Track quizzes without opening an attempt.** `list_quizzes` and `quiz_status` read learner summaries. They never start or submit quizzes. See [quiz tracking and score coverage](docs/quizzes.md).
-- **Check submission history and prepare uploads.** `list_submissions` and `submission_status` answer what was submitted and when. `submit_to_dropbox` previews files first; uploading requires explicit approval of that exact preview and its single-use token. Late uploads require separate approval. See [submission tools and limitations](docs/submissions.md).
+- **Track quiz attempts.** `list_quizzes` reads learner summaries and can filter by quiz name. See [quiz tracking and score coverage](docs/quizzes.md).
+- **Check submission history.** `list_submissions` finds attempts by folder or filename and reports timestamps and lateness. See [submission history](docs/submissions.md).
 - **Keep requested deliverables ready for download.** A private completed-work mailbox lets an authenticated assistant save generated ZIPs with source references and validation reports. Computer sync verifies their hashes and preserves local edits. Saving to the mailbox never submits to CourseLink.
-- **Use the same tools through the computer bridge.** v0.2.0 includes complete bridge forwarding for the expanded tool set.
+- **Use the same tools through the computer bridge.** The bridge adds three tools for Mac downloads, course sync, and sync status.
 
 ## files ready when you need them
 
@@ -48,9 +48,9 @@ Clone this repo and follow the [setup guide](docs/setup.md), or ask a coding ass
 
 ### already connected? refresh your tools
 
-After updating the monitor, reload your MCP client’s connection so it discovers the latest tools and instructions. For a custom CourseLink connection in ChatGPT, open its plugin settings, select **Refresh tools**, then start a new conversation. Updating the server alone can leave ChatGPT using an older tool list.
+Reload your MCP connection after upgrading. If you use Poke, refresh its CourseLink connection so it can discover the current tool list. To check the connection, ask “Did I submit homework.zip?” or “Is Quiz 6 still open?”
 
-Then ask normally: **“What grade did I get on my midterm?”** The server includes tool-routing instructions for grades, quizzes, submissions, deadlines, and update questions. If the assistant cannot access grades, check that the refreshed connection exposes `get_grades` before relying on an announcement about grade release.
+Use `list_submissions(query=...)` for submission history, `list_quizzes(query=...)` for named quizzes, `list_items(category="lab")` for labs, and `list_changes` for cached updates. The [tool reference](docs/setup.md) covers download and batch file lookups.
 
 ## cloud-generated deliverables
 

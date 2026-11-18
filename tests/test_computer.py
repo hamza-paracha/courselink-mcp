@@ -38,11 +38,12 @@ async def test_verified_local_download_reuses_bytes_and_preserves_edits(setup):
 
 async def test_bad_transfer_not_published_and_partial_removed(setup):
     computer, item, version = setup
-    version['sha256'] = '0' * 64
     with pytest.raises(ValueError, match='mismatch'):
-        await computer.save(item, version)
+        await computer.save(item, {**version, 'sha256': '0' * 64})
     assert not list(computer.config.school.rglob('*.partial'))
     assert not list(computer.config.school.rglob('*.pdf'))
+    retry = await computer.save(item, version)
+    assert Path(retry['path']).read_bytes() == b'lab instructions'
 
 
 async def test_symlink_escape_rejected(setup, tmp_path):
@@ -66,9 +67,10 @@ async def test_sync_paginates_all_content_and_saves_metadata(setup):
             return {'session': {'state': 'authenticated'}, 'scanning': False,
                     'last_scan': {'complete': True}}
         if operation == 'items':
+            assert args['compact'] is False
             offsets.append(args['offset'])
             return {'items': [item if args['offset'] == 0 else page], 'total': 2}
-        if operation == 'latest_versions':
+        if operation == 'versions':
             assert args == {'course_id': '1'}
             return {'versions': {item['id']: version}}
         return await original_call(operation, args)
@@ -88,7 +90,7 @@ async def test_missing_cached_file_is_reported(setup):
             return {'session': {'state': 'login_required'}, 'last_scan': {'complete': True}}
         if operation == 'items':
             return {'items': [item], 'total': 1}
-        if operation == 'latest_versions':
+        if operation == 'versions':
             return {'versions': {}}
     computer.call = call
     result = await computer.sync(refresh=False)
@@ -104,11 +106,14 @@ async def test_remote_bridge_requires_own_connection_settings(monkeypatch):
             pytest.fail('A connection without explicit server settings must not be opened.')
 
 
-async def test_remote_bridge_quotes_paths_and_uses_configured_host(monkeypatch):
+@pytest.mark.parametrize('legacy', [False, True])
+async def test_remote_bridge_quotes_paths_and_batches_across_server_versions(monkeypatch, legacy):
     from contextlib import asynccontextmanager
     import shlex
+    from types import SimpleNamespace
     import courselink_mcp.computer as module
     captured = []
+    calls = []
     monkeypatch.setenv('COURSELINK_REMOTE_HOST', 'example-host')
     monkeypatch.setenv('COURSELINK_REMOTE_STATE_DIR', '/srv/private state')
     monkeypatch.setenv('COURSELINK_REMOTE_EXECUTABLE', '/srv/my clone/.venv/bin/courselink')
@@ -131,10 +136,26 @@ async def test_remote_bridge_quotes_paths_and_uses_configured_host(monkeypatch):
         async def initialize(self):
             pass
 
+        async def list_tools(self):
+            return SimpleNamespace(tools=[
+                SimpleNamespace(name='list_items', inputSchema={'properties': {} if legacy else {'compact': {}}}),
+                SimpleNamespace(name='list_file_versions',
+                                inputSchema={'properties': {} if legacy else {'course_id': {}}}),
+            ])
+
+        async def call_tool(self, name, args):
+            calls.append((name, args))
+            return SimpleNamespace(isError=False, structuredContent={'ok': True})
+
     monkeypatch.setattr(module, 'stdio_client', fake_stdio)
     monkeypatch.setattr(module, 'ClientSession', FakeSession)
-    async with module.connect():
-        pass
+    async with module.connect() as call:
+        await call('items', {'course_id': '1', 'compact': False})
+        await call('versions', {'course_id': '1'})
+    assert calls == [
+        ('list_items', {'course_id': '1'} if legacy else {'course_id': '1', 'compact': False}),
+        ('latest_versions' if legacy else 'list_file_versions', {'course_id': '1'}),
+    ]
     assert captured[0].args[-2] == 'example-host'
     assert shlex.split(captured[0].args[-1]) == [
         'env', 'COURSELINK_STATE_DIR=/srv/private state',
@@ -161,7 +182,7 @@ async def test_fresh_sync_reuses_scan_downloads_and_reports_partial_coverage(set
             return {'queued': True}
         if operation == 'items':
             return {'items': [item], 'total': 1}
-        if operation == 'latest_versions':
+        if operation == 'versions':
             assert args == {'course_id': '1'}
             return {'versions': {item['id']: version}}
         return await original_call(operation, args)
@@ -176,7 +197,7 @@ async def test_fresh_sync_reuses_scan_downloads_and_reports_partial_coverage(set
     assert result['saved'] == 1
     assert calls.count('scan') == 1
     assert 'download' not in calls
-    assert calls.count('latest_versions') == 1 and 'versions' not in calls
+    assert calls.count('versions') == 1
     assert len(result['errors']) == (0 if scan_complete else 1)
     # A subsequent sync also avoids transferring unchanged bytes to this computer.
     calls.clear()

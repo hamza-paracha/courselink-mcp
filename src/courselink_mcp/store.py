@@ -11,6 +11,18 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def utc_deadline(value):
+    """Normalize a timezone-aware ISO timestamp for exact SQLite comparisons."""
+    if not isinstance(value, str):
+        return None
+    try:
+        due = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if due.tzinfo is not None:
+            return due.astimezone(timezone.utc).isoformat(timespec='microseconds')
+    except (ValueError, OverflowError):
+        return None
+
+
 def safe_name(name):
     name = re.sub(r'[^\w.() -]', '_', str(name)).strip(' .')[:140]
     return name or 'file'
@@ -24,6 +36,7 @@ class Store:
     def __init__(self, path: Path):
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        self.db.create_function('utc_deadline', 1, utc_deadline, deterministic=True)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA recursive_triggers=ON')
         self.db.executescript('''
@@ -190,9 +203,27 @@ class Store:
             params.append(category)
         where = ' AND '.join(clauses)
         total = self.db.execute('SELECT count(*) FROM items WHERE ' + where, params).fetchone()[0]
-        rows = self.db.execute('SELECT data,available,first_seen,last_seen FROM items WHERE ' + where + ' ORDER BY course_id,kind,title LIMIT ? OFFSET ?',
+        rows = self.db.execute('SELECT data,available,first_seen,last_seen FROM items WHERE ' + where + ' ORDER BY course_id,kind,title,id LIMIT ? OFFSET ?',
                               params + [min(max(limit, 1), 500), max(0, offset)]).fetchall()
         return {'total': total, 'items': [self.item_data(row) for row in rows], 'offset': max(0, offset)}
+
+    def deadlines(self, start, end):
+        rows = self.db.execute("""
+            WITH candidates AS (
+                SELECT i.id, i.course_id, i.kind, i.title,
+                       json_extract(i.data, '$.due_date') AS due_date,
+                       json_extract(i.data, '$.url') AS url
+                FROM items i
+                WHERE i.available=1
+                  AND coalesce(json_extract(i.data, '$.parent_id'), '') IN ('', 0)
+                  AND json_type(i.data, '$.due_date')='text'
+            )
+            SELECT i.*, json_extract(c.data, '$.name') AS course_name
+            FROM candidates i LEFT JOIN courses c ON c.id=i.course_id
+            WHERE utc_deadline(i.due_date) BETWEEN ? AND ?
+            ORDER BY utc_deadline(i.due_date), i.id
+        """, (start.isoformat(timespec='microseconds'), end.isoformat(timespec='microseconds')))
+        return [dict(row) for row in rows]
 
     def document(self, version_id):
         row = self.db.execute('SELECT result FROM documents WHERE version_id=?', (version_id,)).fetchone()
@@ -260,9 +291,13 @@ class Store:
         if course_id:
             sql += ' AND course_id=?'
             params.append(course_id)
-        rows = self.db.execute(sql + ' ORDER BY id LIMIT ?', params + [min(max(limit, 1), 500)]).fetchall()
+        limit = min(max(limit, 1), 500)
+        rows = self.db.execute(sql + ' ORDER BY id LIMIT ?', params + [limit + 1]).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
         results = [{**dict(r), 'details': json.loads(r['details'])} for r in rows]
-        return {'changes': results, 'next_cursor': rows[-1]['id'] if rows else after}
+        return {'changes': results, 'next_cursor': rows[-1]['id'] if rows else after,
+                'has_more': has_more}
 
     def versions(self, item_id):
         return [dict(r) for r in self.db.execute('SELECT * FROM versions WHERE item_id=? ORDER BY id DESC', (item_id,))]

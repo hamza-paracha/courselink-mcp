@@ -106,18 +106,27 @@ class Quizzes:
             quiz['freshness']['refresh_due'] = age >= self.CACHE_SECONDS or not quiz['coverage']['complete']
         return result
 
-    async def list(self, course_id, quiz_id=None):
+    async def list(self, course_id, quiz_id=None, query=None):
         """List learner summaries with independent grade-cache freshness; GET requests only."""
         identifier(course_id)
         if course_id not in self.service.config.courses:
             raise ValueError('Select a monitored course.')
         if quiz_id is not None:
             identifier(quiz_id)
-        key = (course_id, quiz_id)
+        if query is not None and (not isinstance(query, str) or not query.strip()):
+            raise ValueError('Supply a quiz name to search.')
+        needle = query.strip().casefold() if query is not None else None
+        key = (course_id, quiz_id, needle) if needle else (course_id, quiz_id)
         async with self.lock:
+            cutoff = time.monotonic() - self.CACHE_SECONDS
+            self.cache = {key: entry for key, entry in self.cache.items() if entry[0] > cutoff}
             cached = self.cache.get(key)
-            if cached and time.monotonic() - cached[0] < self.CACHE_SECONDS:
+            if cached:
                 return self.fresh(cached[1], 'cache')
+            full = self.cache.get((course_id, None))
+            if full and needle and quiz_id is None:
+                rows = [row for row in full[1]['quizzes'] if needle in row['name'].casefold()]
+                return self.fresh({**full[1], 'quizzes': rows}, 'cache')
             stamp, rows, errors = now(), [], []
             browser = self.service.browser
             try:
@@ -130,6 +139,8 @@ class Quizzes:
                 catalog = [q for q in catalog if not q.get('IsHidden') and (quiz_id is None or str(q['QuizId']) == quiz_id)]
                 if quiz_id is not None and not catalog:
                     errors.append('Requested quiz unavailable in this course.')
+                if needle:
+                    catalog = [quiz for quiz in catalog if needle in quiz['Name'].casefold()]
             except Exception:
                 catalog = []
                 errors.append('Quiz catalog unavailable; sign in or retry later.')
@@ -197,11 +208,3 @@ class Quizzes:
             if result['coverage']['complete']:
                 self.cache[key] = (time.monotonic(), copy.deepcopy(result))
             return self.fresh(result, 'api')
-
-    async def status(self, course_id, query):
-        """Return every case-insensitive name match; never silently choose ambiguous quizzes."""
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError('Supply a quiz name to search.')
-        result = await self.list(course_id)
-        matches = [q for q in result['quizzes'] if query.strip().casefold() in q['name'].casefold()]
-        return {**result, 'query': query, 'quizzes': matches, 'matches': matches}

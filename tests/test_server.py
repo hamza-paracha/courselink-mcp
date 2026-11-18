@@ -1,3 +1,4 @@
+import json
 import httpx
 import pytest
 from courselink_mcp.config import Config
@@ -5,35 +6,55 @@ from courselink_mcp.server import create_app, API
 from courselink_mcp.service import Service
 
 
-async def test_every_registered_tool_has_docstring_and_routing_instructions():
-    import inspect
-    import re
+SHARED_TOOLS = {
+    'courselink_status', 'list_courses', 'open_login', 'get_grades', 'list_quizzes',
+    'list_submissions', 'deadline_digest', 'list_items', 'get_item', 'search_documents',
+    'read_document', 'list_changes', 'check_now', 'list_file_versions', 'download_file',
+    'read_file', 'automation_context', 'save_completed_work', 'list_completed_work',
+    'read_completed_work',
+}
+
+
+async def test_tool_inventory_and_schemas_match_across_transports(setup, monkeypatch):
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
     from mcp.server.fastmcp import FastMCP
-    from courselink_mcp.server import MCP_INSTRUCTIONS, register_tools
+    import courselink_mcp.computer as computer
+    from courselink_mcp.server import stdio
 
-    mcp = FastMCP('routing-test')
-    registered = {}
+    config, service = setup
+    monkeypatch.setattr(service, 'start', AsyncMock())
+    monkeypatch.setattr(service, 'close', AsyncMock())
+    app = create_app(config, service)
+    async with app.app.router.lifespan_context(app.app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://127.0.0.1:8765',
+                                     headers={'Authorization': 'Bearer ' + config.token(),
+                                              'Accept': 'application/json, text/event-stream'}) as client:
+            response = await client.post('/mcp/', json={
+                'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}})
+            response.raise_for_status()
+    http_tools = {tool['name']: tool['inputSchema'] for tool in response.json()['result']['tools']}
+    assert set(http_tools) == SHARED_TOOLS == set(computer.OPERATIONS.values())
+    assert all(tool['description'].strip() for tool in response.json()['result']['tools'])
 
-    class Registry:
-        def tool(self, **kwargs):
-            def register(fn):
-                registered[fn.__name__] = fn
-                return mcp.tool(**kwargs)(fn)
-            return register
+    servers = []
+    monkeypatch.setattr(FastMCP, 'run', lambda mcp, **kwargs: servers.append(mcp))
+    stdio(config)
+    assert {t.name: t.inputSchema for t in await servers[0].list_tools()} == http_tools
 
-    async def unused_call(operation, arguments):
-        raise AssertionError('Registration must not call CourseLink')
+    @asynccontextmanager
+    async def fake_connect():
+        yield API(service).call
 
-    register_tools(Registry(), unused_call)
-    tools = await mcp.list_tools()
-    assert tools
-    # Every shared tool must also route through the optional computer bridge.
-    from courselink_mcp.computer import OPERATIONS
-    assert {tool.name for tool in tools} == set(OPERATIONS.values())
-    for tool in tools:
-        assert inspect.getdoc(registered[tool.name]), tool.name
-        assert tool.description and tool.description.strip(), tool.name
-        assert re.search(r'\b' + re.escape(tool.name) + r'\b', MCP_INSTRUCTIONS), tool.name
+    async def capture(mcp):
+        servers.append(mcp)
+
+    monkeypatch.setattr(computer, 'connect', fake_connect)
+    monkeypatch.setattr(FastMCP, 'run_stdio_async', capture)
+    await computer.computer_stdio(config)
+    mac_tools = {t.name: t.inputSchema for t in await servers[1].list_tools()}
+    assert set(mac_tools) - SHARED_TOOLS == {'download_to_computer', 'sync_to_computer', 'computer_sync_status'}
+    assert {name: mac_tools[name] for name in SHARED_TOOLS} == http_tools
 
 
 @pytest.fixture
@@ -277,7 +298,11 @@ async def test_deadline_digest_is_sorted_cached_and_lists_course(setup, monkeypa
         ('later', '2040-01-03T00:00:00Z'),
         ('earlier', '2040-01-02T00:30:00+02:00'),
         ('offset', '2040-01-01T23:00:00Z'),
-        ('past', '2025-12-31T23:59:59Z'),
+        ('past', '2039-12-31T23:59:59.999999Z'),
+        ('begin', '2040-01-01T00:00:00Z'),
+        ('end-a', '2040-01-01T19:00:00-05:00'),
+        ('end-b', '2040-01-02T00:00:00.000000Z'),
+        ('just-after', '2040-01-02T00:00:00.000001Z'),
         ('far', '2040-02-01T00:00:00Z'),
         ('bad', 'invalid'), ('naive', '2040-01-02'), ('missing', None),
     ]
@@ -296,60 +321,87 @@ async def test_deadline_digest_is_sorted_cached_and_lists_course(setup, monkeypa
     async with service.scan_lock:
         result = await API(service).call('deadline_digest', {})
         assert result['freshness'] == service.freshness()
-    assert [row['id'] for row in result['deadlines']] == ['earlier', 'offset', 'later']
+    assert [row['id'] for row in result['deadlines']] == ['begin', 'earlier', 'offset', 'end-a', 'end-b', 'just-after', 'later']
     assert all(row['course_name'] == 'TEST*1000' for row in result['deadlines'])
     assert not service.wake.is_set()
-    assert [row['id'] for row in (await API(service).call('deadline_digest', {'days': 1}))['deadlines']] == ['earlier', 'offset']
+    assert [row['id'] for row in (await API(service).call('deadline_digest', {'days': 1}))['deadlines']] == ['begin', 'earlier', 'offset', 'end-a', 'end-b']
 
 
-async def test_whats_new_paginates_and_preserves_cursor_and_freshness(setup):
+async def test_list_changes_paginates_and_preserves_cursor_and_freshness(setup):
     _, service = setup
-    service.store.reconcile('1', 'content', [
-        {'id': str(i), 'course_id': '1', 'kind': 'content', 'title': f'Item {i}'}
-        for i in range(501)])
+    for course, count in [('1', 500), ('2', 1)]:
+        service.store.reconcile(course, 'content', [
+            {'id': f'{course}:{i}', 'course_id': course, 'kind': 'content', 'title': f'Item {i}'}
+            for i in range(count)])
     api = API(service)
     async with service.scan_lock:
-        result = await api.call('whats_new', {'since_cursor': None})
-        assert result['freshness'] == service.freshness()
-    expected = service.store.changes(limit=500)['changes']
-    expected += service.store.changes(after=expected[-1]['id'])['changes']
-    assert result['changes'] == expected
-    assert result['total'] == 501
-    assert sum(result['by_event'].values()) == 501
-    assert result['by_course'] == {'1': 501}
-    cursor = result['next_cursor']
-    empty = await api.call('whats_new', {'since_cursor': cursor})
-    assert empty['changes'] == [] and empty['next_cursor'] == cursor
-    service.store.reconcile('2', 'quiz', [
-        {'id': 'new', 'course_id': '2', 'kind': 'quiz', 'title': 'Quiz'}])
-    update = await api.call('whats_new', {'since_cursor': cursor})
-    assert update['total'] == 1 and update['changes'][0]['item_id'] == 'new'
+        first = await api.call('changes', {'limit': 500})
+        assert first['freshness'] == service.freshness()
+    assert first['has_more'] and len(first['changes']) == 500
+    last = await api.call('changes', {'after': first['next_cursor']})
+    assert not last['has_more'] and [row['item_id'] for row in last['changes']] == ['2:0']
+    assert last['changes'][0]['id'] == first['next_cursor'] + 1
+    empty = await api.call('changes', {'after': last['next_cursor']})
+    assert empty['changes'] == [] and empty['next_cursor'] == last['next_cursor']
+    assert not empty['has_more']
+    exact = await api.call('changes', {'limit': 500, 'course_id': 'example-course'})
+    assert exact['changes'] == first['changes'] and not exact['has_more']
     assert not service.wake.is_set()
 
 
-@pytest.mark.parametrize('operation,arguments', [
-    ('deadline_digest', {'days': value}) for value in (0, -1, 366, True, '14')
-] + [('whats_new', {'since_cursor': value}) for value in (-1, True, '0')])
-async def test_cached_summary_validation(setup, operation, arguments):
+@pytest.mark.parametrize('value', [0, -1, 366, True, '14'])
+async def test_cached_summary_validation(setup, value):
     _, service = setup
     with pytest.raises(ValueError):
-        await API(service).call(operation, arguments)
+        await API(service).call('deadline_digest', {'days': value})
 
 
-async def test_cached_summary_mcp_registration_and_dispatch(setup):
+async def test_compact_catalog_preserves_categories_and_rest_defaults(setup):
     from mcp.server.fastmcp import FastMCP
     from courselink_mcp.server import register_tools
+
     _, service = setup
+    starter = {'id': 'starter', 'course_id': '1', 'kind': 'linked_file', 'title': 'Starter ZIP',
+               'category': 'lab', 'description': 'Starter details', 'download_path': '/example.zip',
+               'due_date': '2040-01-01T00:00:00Z'}
+    service.store.reconcile('1', 'linked_file', [starter])
+    service.store.reconcile('1', 'content', [
+        {**starter, 'id': 'rubric', 'kind': 'content', 'title': 'Lab rubric'},
+        {**starter, 'id': 'other', 'kind': 'content', 'title': 'Other', 'category': 'assignment'},
+    ])
     mcp = FastMCP('test')
-    register_tools(mcp, API(service).call)
-    tools = {tool.name: tool for tool in await mcp.list_tools()}
-    for name, args in [('deadline_digest', {}), ('whats_new', {'since_cursor': None})]:
-        assert tools[name].annotations.readOnlyHint
-        assert tools[name].annotations.destructiveHint is False
-        result = await mcp.call_tool(name, args)
-        assert result
-    assert tools['deadline_digest'].inputSchema['properties']['days']['default'] == 14
-    assert 'since_cursor' in tools['whats_new'].inputSchema['required']
+    api = API(service)
+    register_tools(mcp, api.call)
+    filters = {'course_id': 'example-course', 'category': 'lab'}
+    compact = json.loads((await mcp.call_tool('list_items', {**filters, 'limit': 1, 'offset': 1}))[0].text)
+    assert compact['total'] == 2 and compact['offset'] == 1
+    assert compact['items'] == [{key: starter[key] for key in
+                                ('id', 'course_id', 'kind', 'category', 'title', 'due_date')}
+                               | {'has_file': True}]
+    assert compact['freshness'] == service.freshness()
+    full = json.loads((await mcp.call_tool('list_items', {**filters, 'compact': False}))[0].text)
+    assert full == await api.call('items', filters)
+    assert full['items'][1]['description'] == starter['description']
+    with pytest.raises(ValueError, match='Category'):
+        await api.call('items', {'category': 'quiz'})
+
+
+async def test_version_scopes_preserve_item_history_and_course_batch(setup):
+    _, service = setup
+    api = API(service)
+    service.store.reconcile('1', 'content', [
+        {'id': 'file', 'course_id': '1', 'kind': 'content', 'title': 'File'}])
+    with service.store.db:
+        service.store.db.executemany(
+            'INSERT INTO versions(item_id,sha256,path,size,downloaded_at) VALUES (?,?,?,?,?)',
+            [('file', str(i), '/test', i, '2040-01-01T00:00:00Z') for i in (1, 2)])
+    versions = (await api.call('versions', {'item_id': 'file'}))['versions']
+    assert [row['size'] for row in versions] == [2, 1]
+    batch = await api.call('versions', {'course_id': 'example-course'})
+    assert batch['versions'] == {'file': versions[0]}
+    for scopes in ({}, {'course_id': '1', 'item_id': 'file'}):
+        with pytest.raises(ValueError, match='exactly one'):
+            await api.call('versions', scopes)
 
 
 async def test_private_mailbox_http_roundtrip_above_standard_body_limit(setup):

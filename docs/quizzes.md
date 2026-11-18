@@ -1,19 +1,14 @@
 # Quiz attempt tracking
 
-The shared MCP registration exposes 21 tools, including these two read-only quiz tools through HTTP MCP, stdio and the computer bridge:
+Use `list_quizzes(course_id, quiz_id=None, query=None)` to browse learner quizzes or filter by numeric quiz ID or name. Pass a monitored course ID or its configured folder abbreviation. For example, `list_quizzes(course_id="example-course", query="Quiz06")` returns every visible name match in `quizzes`. The monitor filters the catalog before requesting learner summaries. An empty result establishes absence only when coverage is complete.
 
-| Tool | Arguments | Use |
-| --- | --- | --- |
-| `list_quizzes` | `course_id: str`, `quiz_id: str \| null = null` | Browse learner quizzes or inspect one numeric quiz ID |
-| `quiz_status` | `course_id: str`, `query: str` | Answer “Was Quiz06 attempted, how many attempts, and is it still open?” |
-
-Both accept a monitored course ID or its configured folder abbreviation, such as `example-course`. Name searches use a case-insensitive substring and return every match in `matches` and `quizzes`; multiple matches remain ambiguous. An empty match list only establishes absence when coverage is complete. HTTP equivalents are `/api/quizzes` and `/api/quiz_status` (GET or POST), using the existing bearer authentication.
+The equivalent HTTP operation is `/api/quizzes` (GET or POST). The older `/api/quiz_status` route remains a read-only compatibility alias. Both use bearer authentication.
 
 Use `deadline_digest` for upcoming due dates across courses, `get_grades` for the full gradebook, and `list_submissions` for dropbox submission history. Deadline digests keep their existing cached scan behavior and do not fetch quiz summaries.
 
 ## Read-only sources and freshness
 
-Quiz metadata comes from GET `/d2l/api/le/<discovered-version>/<course>/quizzes/`, with GET `quizzes/<quiz-id>` when grade-item metadata is absent from the list. Hidden catalog rows are excluded. Attempt counts come only from GET `/d2l/lms/quizzing/user/quiz_summary.d2l?qi=<quiz-id>&ou=<course>` through the service's existing authenticated browser. The learner attempts API commonly returns 403 and is never requested. These tools never click **Start Quiz**, start an attempt, submit answers, or issue mutations.
+Quiz metadata comes from GET `/d2l/api/le/<discovered-version>/<course>/quizzes/`, with GET `quizzes/<quiz-id>` when grade-item metadata is absent from the list. Hidden catalog rows are excluded. Attempt counts come only from GET `/d2l/lms/quizzing/user/quiz_summary.d2l?qi=<quiz-id>&ou=<course>` through the service's existing authenticated browser. The learner attempts API commonly returns 403 and is never requested. The tool reads learner summaries with GET.
 
 Successful complete results use a 30-second in-memory cache under a shared read lock. Background scans do not refresh it. Results include `checked_at`, `source` (`api` or `cache`), `freshness` (age, refresh interval, refresh-due flag and session state), and `coverage` with `complete` and `errors`. Individual quizzes also carry coverage and freshness. Forbidden/missing pages, login redirects and unrecognized summaries produce unknown attempt fields and coverage errors; they never imply zero attempts and do not raise an upstream error to the caller. Partial results are not cached. Invalid arguments still produce validation errors.
 
@@ -40,7 +35,7 @@ When a gradebook is available, `score_checked_at`, `score_freshness` and `score_
 
 ## Offline verification
 
-`tests/fixtures/quiz_summary_*.html` contains synthetic English summaries for Test Student, with open 1-of-2, closed zero, closed two, and login-page cases. Tests cover unlimited counts, changed IDs, score release, forbidden/unavailable pages, caching, ambiguous searches, shared MCP registration (21 tools), HTTP authorization and dispatch. No sign-in or network access is required:
+`tests/fixtures/quiz_summary_*.html` contains synthetic English summaries for Test Student, with open 1-of-2, closed zero, closed two, and login-page cases. Tests cover unlimited counts, changed IDs, score release, forbidden/unavailable pages, caching, ambiguous searches, shared MCP registration, HTTP authorization and dispatch. No sign-in or network access is required:
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m pytest -q --ignore=tests/test_bridge.py .

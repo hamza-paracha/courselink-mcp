@@ -114,8 +114,8 @@ async def test_summary_unavailable_never_claims_not_attempted(service, mode):
         service.browser.get.side_effect = LoginRequired('SYNTHETIC SECRET')
     else:
         service.browser.get.return_value = fixture('login')
-    result = await service.quizzes.status('123', 'quiz06')
-    row = result['matches'][0]
+    result = await service.quizzes.list('123', query='quiz06')
+    row = result['quizzes'][0]
     assert row['attempts_completed'] is None and row['attempted'] is None
     assert row['status'] == 'unknown' and row['is_open'] is None
     assert not row['coverage']['complete'] and not result['coverage']['complete']
@@ -149,13 +149,33 @@ async def test_filter_quiz_id_and_detail_grade_item(service):
 
 
 async def test_name_search_ambiguity_and_validation(service):
-    service.browser.paged.return_value *= 2
-    result = await service.quizzes.status('123', 'qUIz06')
-    assert len(result['matches']) == 2
-    assert (await service.quizzes.status('123', 'absent'))['matches'] == []
-    for args in [('123', ''), ('123', None)]:
+    original = service.browser.paged.return_value[0]
+    service.browser.paged.return_value = [
+        original, {**original, 'QuizId': 8, 'Name': 'Practice Quiz06'},
+        {**original, 'QuizId': 9, 'Name': 'Other'},
+        {**original, 'Name': 'Hidden Quiz06', 'IsHidden': True},
+    ]
+    async def get(path, **kwargs):
+        quiz = next(q for q in service.browser.paged.return_value if f"qi={q['QuizId']}&" in path)
+        return fixture().replace(original['Name'], quiz['Name'])
+
+    service.browser.get.side_effect = get
+    result = await service.quizzes.list('123', query='  qUIz06  ')
+    assert [q['name'] for q in result['quizzes']] == [original['Name'], 'Practice Quiz06']
+    assert service.browser.get.await_count == 2
+    no_match = await service.quizzes.list('123', query='absent')
+    assert no_match['quizzes'] == [] and no_match['coverage']['complete']
+    assert service.browser.get.await_count == 2
+    assert service.get_grades.await_count == 1
+    full = await service.quizzes.list('123')
+    assert len(full['quizzes']) == 3
+    assert service.browser.get.await_count == 5
+    warm = await service.quizzes.list('123', query='Other')
+    assert [q['name'] for q in warm['quizzes']] == ['Other']
+    assert warm['source'] == 'cache' and service.browser.get.await_count == 5
+    for query in ('', '   ', False):
         with pytest.raises(ValueError):
-            await service.quizzes.status(*args)
+            await service.quizzes.list('123', query=query)
     for course, quiz in [('../bad', None), ('999', None), ('123', '../bad')]:
         with pytest.raises(ValueError):
             await service.quizzes.list(course, quiz)
@@ -191,17 +211,15 @@ async def test_server_tool_schemas_dispatch_and_rest(service):
     mcp = FastMCP('test')
     register_tools(mcp, API(service).call)
     tools = {t.name: t for t in await mcp.list_tools()}
-    assert len(tools) == 26
-    for name in ('list_quizzes', 'quiz_status'):
-        assert tools[name].annotations.readOnlyHint and not tools[name].annotations.destructiveHint
-        assert 'deadline_digest' in tools[name].description
-        assert 'get_grades' in tools[name].description and 'list_submissions' in tools[name].description
-    assert tools['list_quizzes'].inputSchema['required'] == ['course_id']
-    assert tools['list_quizzes'].inputSchema['properties']['quiz_id']['default'] is None
-    assert tools['quiz_status'].inputSchema['required'] == ['course_id', 'query']
-    content = await mcp.call_tool('quiz_status', {'course_id': 'example-course', 'query': 'Quiz06'})
+    assert 'quiz_status' not in tools
+    tool = tools['list_quizzes']
+    assert tool.annotations.readOnlyHint and not tool.annotations.destructiveHint
+    assert tool.inputSchema['required'] == ['course_id']
+    assert tool.inputSchema['properties']['quiz_id']['default'] is None
+    assert tool.inputSchema['properties']['query']['default'] is None
+    content = await mcp.call_tool('list_quizzes', {'course_id': 'example-course', 'query': 'Quiz06'})
     result = json.loads(content[0].text)
-    assert result['matches'][0]['attempts_completed'] == 1
+    assert result['quizzes'][0]['attempts_completed'] == 1
     content = await mcp.call_tool('list_quizzes', {'course_id': 'example-course', 'quiz_id': '7'})
     result = json.loads(content[0].text)
     assert result['quizzes'][0]['quiz_id'] == '7'

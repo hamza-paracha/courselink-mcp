@@ -1,31 +1,15 @@
-"""Learner dropbox history and explicitly confirmed uploads. Never called by workers."""
+"""Read-only learner dropbox history."""
 import asyncio
 import copy
-from contextvars import ContextVar
 from datetime import datetime, timezone
-import hashlib
 from html.parser import HTMLParser
-import mimetypes
-import os
-from pathlib import Path
 import re
-import secrets
-import stat
 import time
 from zoneinfo import ZoneInfo
 
 from .browser import LoginRequired
 from .catalog import richtext
-from .store import canonical, now
-
-
-# Inherited by child tasks, so worker callbacks cannot acquire upload privileges.
-background_monitor = ContextVar('courselink_background_monitor', default=False)
-
-
-def require_interactive_submission():
-    if background_monitor.get():
-        raise ValueError('Background monitor tasks cannot submit coursework.')
+from .store import now
 
 
 def timestamp(value):
@@ -214,14 +198,11 @@ def parse_history(html, folder_id, due):
 
 class Submissions:
     CACHE_SECONDS = 30
-    PREVIEW_SECONDS = 300
 
     def __init__(self, service):
         self.service = service
         self.cache = {}
         self.read_lock = asyncio.Lock()
-        self.upload_lock = asyncio.Lock()
-        self.previews = {}
 
     @property
     def browser(self):
@@ -236,7 +217,29 @@ class Submissions:
         if not self.browser.versions.get('le'):
             await self.browser.discover_versions()
 
-    async def list(self, course_id, folder_id=None, *, refresh=False):
+    async def list(self, course_id, folder_id=None, query=None, *, refresh=False):
+        if query is not None and (not isinstance(query, str) or not query.strip()):
+            raise ValueError('Supply a filename or folder name to search.')
+        result = await self.history(course_id, folder_id, refresh=refresh)
+        if query is None:
+            return result
+        needle = query.strip().casefold()
+        matches = []
+        for folder in result['folders']:
+            for submission in folder['submissions']:
+                if needle in folder['name'].casefold() or any(
+                        needle in file['name'].casefold() for file in submission['files']):
+                    matches.append({'folder_id': folder['folder_id'], 'folder': folder['name'],
+                                    'due_date': folder['due_date'], **submission})
+        latest = max(matches, key=lambda match: match['submitted_at_utc'] or '', default=None)
+        return {'latest_submission': latest,
+                'submitted_at_utc': latest['submitted_at_utc'] if latest else None,
+                'files': latest['files'] if latest else [], 'note': result['note'],
+                'course_id': course_id, 'query': query, 'submitted': True if matches else
+                False if result['coverage']['complete'] else None, 'matches': matches,
+                'coverage': result['coverage'], 'checked_at': result['checked_at'], 'source': result['source']}
+
+    async def history(self, course_id, folder_id=None, *, refresh=False):
         await self.ready(course_id)
         if folder_id is not None:
             identifier(folder_id)
@@ -289,156 +292,3 @@ class Submissions:
             if result['coverage']['complete']:
                 self.cache[key] = (time.monotonic(), copy.deepcopy(result))
             return result
-
-    async def status(self, course_id, query, folder_id=None):
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError('Supply a filename or folder name to search.')
-        result = await self.list(course_id, folder_id)
-        matches = []
-        for folder in result['folders']:
-            for submission in folder['submissions']:
-                if query.casefold() in folder['name'].casefold() or any(
-                        query.casefold() in f['name'].casefold() for f in submission['files']):
-                    matches.append({'folder_id': folder['folder_id'], 'folder': folder['name'],
-                                    'due_date': folder['due_date'], **submission})
-        latest = max(matches, key=lambda m: m['submitted_at_utc'] or '', default=None)
-        return {'latest_submission': latest,
-                'submitted_at_utc': latest['submitted_at_utc'] if latest else None,
-                'files': latest['files'] if latest else [], 'note': result['note'],
-                'course_id': course_id, 'query': query, 'submitted': True if matches else
-                False if result['coverage']['complete'] else None, 'matches': matches,
-                'coverage': result['coverage'], 'checked_at': result['checked_at'], 'source': result['source']}
-
-    def files(self, paths):
-        if not isinstance(paths, list) or not 1 <= len(paths) <= 10:
-            raise ValueError('Supply 1–10 files on the service host.')
-        root = self.service.config.school.resolve()
-        limit = min(self.service.config.max_file_bytes, 100 * 1024 * 1024)
-        allowed = {'.pdf', '.txt', '.md', '.csv', '.docx', '.pptx', '.xlsx', '.zip', '.png', '.jpg',
-                   '.jpeg', '.py', '.c', '.h', '.cpp', '.java', '.x68', '.asm'}
-        metadata, payloads, names = [], [], set()
-        total = 0
-        for value in paths:
-            if not isinstance(value, str):
-                raise ValueError('File paths must be strings.')
-            path = Path(value)
-            if not path.is_absolute():
-                raise ValueError(f'Path must be absolute on the service host: {value}')
-            if not path.resolve().is_relative_to(root):
-                raise ValueError(f'Path not under the school directory ({root}): {value}')
-            if not path.exists():
-                raise ValueError(f'File not found on the service host: {value}')
-            if path.is_symlink():
-                raise ValueError(f'Symlinks are not allowed: {value}')
-            if any(p.is_symlink() for p in path.parents):
-                raise ValueError('Symlink directories are not allowed.')
-            if (path.suffix.lower() not in allowed or not re.fullmatch(r'[\w][\w .()-]{0,199}', path.name)
-                    or path.name.casefold() in names):
-                raise ValueError('Unsupported, duplicate, or unsafe filename.')
-            names.add(path.name.casefold())
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            try:
-                # Validate the descriptor before fdopen, which rejects directories itself.
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o111 or not 0 < info.st_size <= limit:
-                    raise ValueError('Empty, executable, nonregular, or oversized file refused.')
-                total += info.st_size
-                if total > limit:
-                    raise ValueError('Combined upload exceeds the size limit.')
-                with os.fdopen(fd, 'rb', closefd=False) as handle:
-                    data = handle.read(info.st_size + 1)
-                if len(data) != info.st_size:
-                    raise ValueError('File changed while reading; create another preview.')
-            finally:
-                os.close(fd)
-            if data.startswith((b'MZ', b'\x7fELF')) or (path.suffix.lower() in {'.txt', '.md', '.csv', '.py', '.c', '.h', '.cpp', '.java', '.x68', '.asm'} and b'\x00' in data):
-                raise ValueError('Unexpected binary or executable content.')
-            metadata.append({'name': path.name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
-            # The confirmed bytes, not mutable filesystem paths, reach Playwright.
-            payloads.append({'name': path.name, 'mimeType': mimetypes.guess_type(path.name)[0] or
-                             'application/octet-stream', 'buffer': data})
-        return metadata, payloads
-
-    def audit(self, attempt, event, **fields):
-        path = self.service.config.state / 'submission-audit.jsonl'
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, 'a') as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(canonical({'at': now(), 'attempt': attempt, 'event': event, **fields}) + '\n')
-            handle.flush()
-            os.fsync(handle.fileno())
-
-    async def submit(self, course_id, folder_id, files, confirm=False, preview_token=None, allow_late=False,
-                     allow_resubmit=False):
-        attempt = secrets.token_hex(12)
-        self.audit(attempt, 'attempt', confirmed=confirm is True)
-        try:
-            require_interactive_submission()
-            identifier(folder_id)
-            if type(confirm) is not bool or type(allow_late) is not bool or type(allow_resubmit) is not bool:
-                raise ValueError('confirm, allow_late and allow_resubmit must be booleans.')
-            async with self.upload_lock:
-                self.previews = {k: v for k, v in self.previews.items() if v[0] > time.monotonic()}
-                previous = self.previews.pop(preview_token, None) if isinstance(preview_token, str) else None
-                if confirm and previous is None:
-                    raise ValueError('A valid, unused preview token is required; preview again.')
-                identifier(course_id)
-                history = await self.list(course_id, folder_id, refresh=True)
-                if len(history['folders']) != 1:
-                    raise ValueError('Expected exactly one dropbox folder.')
-                folder = history['folders'][0]
-                if not folder['due_date_known']:
-                    raise ValueError('Cannot verify the folder deadline; upload refused.')
-                if not folder['coverage']['complete']:
-                    raise ValueError('Cannot verify existing submissions; upload refused.')
-                metadata, payloads = await asyncio.to_thread(self.files, files)
-                due = timestamp(folder['due_date'])
-                late = datetime.now(timezone.utc) > due if due else False
-                preview = {'course_id': course_id, 'folder_id': folder_id, 'folder': folder['name'],
-                           'due_date': folder['due_date'], 'files': metadata, 'would_be_late': late,
-                           'allows_resubmission': folder['allows_resubmission'],
-                           'existing_submissions': len(folder['submissions'])}
-                binding = hashlib.sha256(canonical({'preview': preview, 'folder': folder}).encode()).hexdigest()
-                if not confirm:
-                    token = secrets.token_urlsafe(32)
-                    if len(self.previews) >= 128:
-                        self.previews.pop(next(iter(self.previews)))
-                    self.previews[token] = (time.monotonic() + self.PREVIEW_SECONDS, binding)
-                    self.audit(attempt, 'preview', **preview)
-                    return {**preview, 'dry_run': True, 'preview_token': token, 'expires_in_seconds': self.PREVIEW_SECONDS}
-                if previous[1] != binding:
-                    raise ValueError('Files or folder state changed; preview again.')
-                if late and not allow_late:
-                    raise ValueError('Past due; allow_late=true is also required.')
-                if folder['submissions'] and folder['allows_resubmission'] is False:
-                    raise ValueError('This folder already has a submission and CourseLink says resubmission is not allowed.')
-                if folder['submissions'] and folder['allows_resubmission'] is None and not allow_resubmit:
-                    raise ValueError(
-                        f"This folder already has {len(folder['submissions'])} submission(s) and CourseLink does not say "
-                        'whether resubmitting is allowed. Preview again and confirm with allow_resubmit=true '
-                        'only if the user explicitly approved adding another submission.')
-                availability = folder['availability'] or {}
-                current = datetime.now(timezone.utc)
-                start, end = timestamp(availability.get('StartDate')), timestamp(availability.get('EndDate'))
-                if (start and current < start) or (end and current >= end):
-                    raise ValueError('Folder is not currently open.')
-                def preflight():
-                    current = datetime.now(timezone.utc)
-                    if time.monotonic() >= previous[0]:
-                        raise ValueError('Preview expired; preview again.')
-                    if due and current > due and not allow_late:
-                        raise ValueError('Past due; preview again with explicit late approval.')
-                    if (start and current < start) or (end and current >= end):
-                        raise ValueError('Folder is not currently open.')
-                preflight()
-                self.audit(attempt, 'upload_started', **preview)
-                # No retry: a lost response may still mean a successful submission.
-                try:
-                    result = await self.browser.upload_dropbox(course_id, folder_id, payloads, preflight=preflight)
-                finally:
-                    self.cache.clear()
-                self.audit(attempt, 'upload_result', outcome=result['outcome'])
-                return {**preview, 'dry_run': False, **result}
-        except BaseException as exc:
-            self.audit(attempt, 'failed', error_type=type(exc).__name__)
-            raise

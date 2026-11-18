@@ -86,7 +86,7 @@ Reload the client's MCP connection and verify that CourseLink tools are visible.
 Request a scan with `check_now(force_refresh=True)` or `uv run courselink check`, then wait for it to finish. Check:
 
 - `courselink_status` shows authentication, the intended monitored courses, and a finished scan. Read its coverage/errors; report partial scans accurately.
-- `list_items` or `list_materials` returns available material for a selected course.
+- `list_items` returns available material for a selected course.
 - If a downloadable file exists, `list_file_versions` shows a saved version and its file exists in the configured download folder. Read it with `read_document` or `read_file` to confirm access. If there are no attachments, say so; do not require a nonexistent file for setup success.
 - The monitor is still running and the configured assistant can call the tools.
 

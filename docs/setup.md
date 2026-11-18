@@ -64,26 +64,26 @@ Try asking your client to check for new assignments, find a lab's instructions, 
 | --- | --- |
 | `courselink_status` | Authentication, freshness, scan errors, and index coverage |
 | `list_courses` | Discover accessible courses and monitored folder mappings |
-| `list_submissions` | Read learner dropbox history, files, timestamps, comments and feedback |
-| `submission_status` | Find whether a filename/folder was submitted and when |
-| `submit_to_dropbox` | Preview files; upload only with explicit confirmation and a matching preview token |
-| `list_quizzes` | Read learner quiz summaries, attempt counts, availability and released scores |
-| `quiz_status` | Find quiz status by a case-insensitive name substring |
+| `list_submissions` | Read learner dropbox history or search by folder/filename with `query` |
+| `list_quizzes` | Read learner quiz summaries, optionally filtered by ID or name with `query` |
 | `get_grades` | Read grades for one or all monitored courses with per-course freshness and coverage |
-| `list_items` | Search and paginate content, assignments, announcements, events, quizzes, and linked files |
-| `list_materials` | Find labs or assignments across indexed sources |
+| `list_items` | Search cached items. Use `category=lab` or `category=assignment` for inferred material groups |
 | `get_item` | Instructions, dates, availability, and original URL |
 | `read_document` | Read extracted text or a specific ZIP member |
 | `search_documents` | Search indexed document text |
 | `deadline_digest` | List cached upcoming deadlines across courses |
-| `whats_new` | Summarize cached changes after a supplied cursor |
 | `list_changes` | Read discoveries, updates, and files no longer visible |
-| `list_file_versions` | List retained revisions with hashes and timestamps |
-| `latest_versions` | Latest saved version for each available item in a course |
+| `list_file_versions` | List retained revisions for an item, or resolve each item’s latest revision for a course |
 | `download_file` | Recheck a file and preserve changed bytes |
 | `read_file` | Read saved bytes in base64 chunks |
 | `check_now` | Read cached changes; `force_refresh=True` explicitly queues a scan |
 | `open_login` | Open the local browser or explain remote session renewal |
+| `automation_context` | Read owner guidance and the discovery baseline |
+| `save_completed_work` | Save a requested ZIP in the private mailbox |
+| `list_completed_work` | List mailbox deliverables |
+| `read_completed_work` | Read a saved deliverable in chunks |
+
+These 20 tools are shared by HTTP MCP and stdio. The Mac bridge adds `download_to_computer`, `sync_to_computer`, and `computer_sync_status`. MCP item listings default to compact metadata. Call `get_item` for one full record or use `list_items(compact=False)` for a full catalog page. REST item listings default to full records.
 
 `read_document` reuses saved files by default. It downloads missing files. Saved copies return immediately; when metadata changes or a file recheck is due, it queues a background scan. Check `refresh_queued` and `source_checked_at` before claiming the latest contents. Set `refresh=True` to force an immediate remote check, or `refresh=False` to require a saved copy. Cached reads also work while signed out. The response reports whether it freshly checked the file or queued a refresh. If you need current bytes before answering, explicitly request `refresh=True`. Labels are inferred from titles and module paths; use `list_items` and full-text search when a lab or assignment is not grouped as expected. Text extraction has time, memory, and size limits. Inspect the original file for scanned pages, diagrams, layout-sensitive tables, unsupported formats, or truncated text. ZIP contents are read without executing or extracting them onto disk.
 
@@ -112,7 +112,7 @@ uv run courselink grades --course example-course --refresh --json
 
 `deadline_digest(days=14)` lists upcoming cached deadlines, sorted by UTC time, across courses. `days` must be an integer from 1 to 365. Attachments are omitted to avoid duplicating their parent's deadline; missing, invalid or timezone-less dates are omitted. This lists deadlines, without checking submission status or fetching quiz summaries.
 
-`whats_new(since_cursor)` summarizes all cached events after a nonnegative cursor; pass null for the initial baseline. It returns the events, counts by event/course, and `next_cursor` to save for the next call. Use `list_changes` for pagination or course filtering. Initial discovery does not prove new uploads. Both tools return scan freshness and never trigger a scan; report stale or partial coverage.
+Use `list_changes(after=cursor)` to read cached updates. Follow `has_more` and save the returned `next_cursor` between polls. The initial discovery is a baseline. Report the last successful check and incomplete coverage.
 
 ### Quiz status, submission history and explicit uploads
 
@@ -213,22 +213,20 @@ The service also provides MCP Streamable HTTP at `/mcp/` and REST endpoints unde
 | `/api/status` | GET | None |
 | `/api/health` | GET | Worker health only; requires the same bearer token |
 | `/api/courses` | GET | None |
-| `/api/quizzes` | GET or POST | Required `course_id` (monitored ID/folder), optional numeric `quiz_id`; learner summaries and coverage |
-| `/api/quiz_status` | GET or POST | Required `course_id` and `query`; case-insensitive quiz name matches |
+| `/api/quizzes` | GET or POST | Required `course_id` (monitored ID/folder), optional numeric `quiz_id` and name substring `query` |
+| `/api/quiz_status` (compatibility) | GET or POST | Required `course_id` and `query`; case-insensitive quiz name matches |
 | `/api/grades` | GET | Optional `course_id` (monitored ID/folder), `refresh=true` to bypass the grades cache; normalized grades, per-course freshness and coverage |
-| `/api/submissions` | GET or POST | Required `course_id`, optional `folder_id`; learner submission history |
-| `/api/submission_status` | GET or POST | Required `course_id` and `query`, optional `folder_id` |
-| `/api/submit_to_dropbox` | POST | Course, folder and service-host files; preview first, explicit confirmation token required |
+| `/api/submissions` | GET or POST | Required `course_id`, optional `folder_id` and folder or filename substring `query` |
+| `/api/submission_status` (compatibility) | GET or POST | Required `course_id` and `query`, optional `folder_id` |
 | `/api/deadline_digest` | POST | Optional `days` integer, 1–365 (default 14); cached deadlines |
-| `/api/whats_new` | POST | `since_cursor`: nonnegative integer or null; cached change summary |
-| `/api/items` | GET | `course_id`, `kind`, `query`, `limit`, `offset` |
-| `/api/materials` | GET | `course_id`, `material_type`, `limit`, `offset` |
+| `/api/items` | GET | `course_id`, `kind`, `category`, `query`, `limit`, `offset`, `compact` |
+| `/api/materials` (compatibility) | GET | `course_id`, `material_type`, `limit`, `offset` |
 | `/api/document` | POST | `item_id`, optional `archive_member`, `offset`, `length`, `refresh` |
 | `/api/search_documents` | GET | `query`, `course_id`, `limit` |
 | `/api/item` | GET | `item_id` |
 | `/api/changes` | GET | `after`, `limit`, `course_id` |
-| `/api/versions` | GET | `item_id` |
-| `/api/latest_versions` | GET | `course_id` |
+| `/api/versions` | GET | Exactly one of `item_id` for history or `course_id` for a batch of latest versions |
+| `/api/latest_versions` (compatibility) | GET | `course_id` |
 | `/api/download` | POST | `item_id` |
 | `/api/read_file` | POST | `version_id`, `offset`, `length` |
 | `/api/scan` | POST | Cached updates by default; `force_refresh: true` queues a scan, optionally with `verify_files: true` for all file bytes |
