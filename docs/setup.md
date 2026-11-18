@@ -1,0 +1,249 @@
+# Setup and reference
+
+For agent-assisted setup, ask your coding agent to follow [AGENTS.md](../AGENTS.md). It handles installation, course discovery, and MCP configuration; you sign in and select your courses.
+
+Monitor University of Guelph CourseLink, keep versioned downloads, and search course materials through an MCP client. Run it on your own Mac or Linux machine and sign in with your own account in a dedicated browser window.
+
+The monitor indexes accessible content, assignment instructions, announcements, calendar events, and quiz metadata. It preserves file revisions, records changes, and extracts text from PDFs, Office documents, text files, and ZIP members. Background monitoring does not submit assignments or start quizzes. Explicit uploads use the separate confirmation workflow in [Submission history and uploads](submissions.md).
+
+## Quick start
+
+Requires Python 3.11–3.14, [uv](https://docs.astral.sh/uv/), and macOS or Linux. On Windows, use WSL with a graphical browser environment; native Windows is not supported because the CLI uses POSIX file locking.
+
+```sh
+git clone <repository-url>
+cd courselink-mcp
+uv sync --locked
+uv run playwright install chromium
+uv run courselink init
+```
+
+On Linux, install Chromium's system dependencies if needed with `uv run playwright install --with-deps chromium`.
+
+`init` prints the location of your private `config.json`. By default, configuration and browser state live in `~/Library/Application Support/CourseLink MCP`. Set `COURSELINK_STATE_DIR` to choose another location, using the same value for every command and MCP client.
+
+A new installation starts with **no courses selected**. Sign in, start the background monitor, and discover your courses:
+
+```sh
+uv run courselink login
+uv run courselink start
+uv run courselink status
+uv run courselink courses
+```
+
+Complete sign-in and MFA in the separate Chromium window. `start` reuses an existing local monitor or starts one in the background; you can close the terminal afterward. The host must stay online. Wait for the initial scan to finish before reading the course list.
+
+Select courses with their discovered IDs. The following ID is **fictional**:
+
+```sh
+uv run courselink configure --course 123456=example-course
+uv run courselink check
+```
+
+Repeat `--course ID=FOLDER` to add more courses. Selections are merged into the private config and take effect on the next scan without restarting. Folder names may contain letters, digits, hyphens, or underscores. Downloads are saved under `<school>/<course-folder>/CourseLink Downloads/`; `school` defaults to the private state's `downloads` directory.
+
+Use `uv run courselink serve` when you prefer a foreground monitor. Background startup logs are stored in the private state's `service.log`; `start` does not install a boot service.
+
+## Connect an MCP client
+
+Generate a ready-to-use client entry with your own paths:
+
+```sh
+uv run courselink mcp-config
+```
+
+Merge the resulting `courselink` entry into your MCP client's private configuration. It uses the installed Python interpreter directly and automatically starts the local monitor when needed. Preserve other configured servers. Reload the client's MCP connection after adding it.
+
+Alternatively, adapt [mcp-client.json](../examples/mcp-client.json), replacing its example clone path. If you use a custom `COURSELINK_STATE_DIR`, include that same value in the client's environment. The generated entry already includes it.
+
+Plain `courselink stdio` connects to an existing monitor. `courselink stdio --start-service` starts a missing local monitor; it deliberately rejects custom server URL/token overrides. Use plain stdio for those remote configurations.
+
+Try asking your client to check for new assignments, find a lab's instructions, search downloaded documents, or list recently updated files. Course IDs and your configured folder names both work as course filters. Cached lists, changes, document search, and status include `freshness`: the last successful check time, its age, whether the latest scan completed, and whether a refresh is due. Routine “anything new?”, “anything new now?”, and “check for updates” questions use `list_changes` with the saved cursor, follow pagination, and report when CourseLink was last checked. Return the cache immediately, including while a scan is running or overdue; explain stale/partial coverage or an expired session instead of forcing a scan. An empty change list is not proof of no updates beyond that coverage. Only when the user explicitly asks to force a refresh, rescan, or bypass the cache, call `check_now(force_refresh=True)` and wait for a new completed scan before answering. These instructions are shared by the HTTP, stdio, and computer bridges. Reconnect clients after updating the server so they reload instructions and tool descriptions.
+
+| Tool | Purpose |
+| --- | --- |
+| `courselink_status` | Authentication, freshness, scan errors, and index coverage |
+| `list_courses` | Discover accessible courses and monitored folder mappings |
+| `list_submissions` | Read learner dropbox history or search by folder/filename with `query` |
+| `list_quizzes` | Read learner quiz summaries, optionally filtered by ID or name with `query` |
+| `get_grades` | Read grades for one or all monitored courses with per-course freshness and coverage |
+| `list_items` | Search cached items. Use `category=lab` or `category=assignment` for inferred material groups |
+| `get_item` | Instructions, dates, availability, and original URL |
+| `read_document` | Read extracted text or a specific ZIP member |
+| `search_documents` | Search indexed document text |
+| `deadline_digest` | List cached upcoming deadlines across courses |
+| `list_changes` | Read discoveries, updates, and files no longer visible |
+| `list_file_versions` | List retained revisions for an item, or resolve each item’s latest revision for a course |
+| `download_file` | Recheck a file and preserve changed bytes |
+| `read_file` | Read saved bytes in base64 chunks |
+| `check_now` | Read cached changes; `force_refresh=True` explicitly queues a scan |
+| `open_login` | Open the local browser or explain remote session renewal |
+| `automation_context` | Read owner guidance and the discovery baseline |
+| `save_completed_work` | Save a requested ZIP in the private mailbox |
+| `list_completed_work` | List mailbox deliverables |
+| `read_completed_work` | Read a saved deliverable in chunks |
+
+These 20 tools are shared by HTTP MCP and stdio. The Mac bridge adds `download_to_computer`, `sync_to_computer`, and `computer_sync_status`. MCP item listings default to compact metadata. Call `get_item` for one full record or use `list_items(compact=False)` for a full catalog page. REST item listings default to full records.
+
+`read_document` reuses saved files by default. It downloads missing files. Saved copies return immediately; when metadata changes or a file recheck is due, it queues a background scan. Check `refresh_queued` and `source_checked_at` before claiming the latest contents. Set `refresh=True` to force an immediate remote check, or `refresh=False` to require a saved copy. Cached reads also work while signed out. The response reports whether it freshly checked the file or queued a refresh. If you need current bytes before answering, explicitly request `refresh=True`. Labels are inferred from titles and module paths; use `list_items` and full-text search when a lab or assignment is not grouped as expected. Text extraction has time, memory, and size limits. Inspect the original file for scanned pages, diagrams, layout-sensitive tables, unsupported formats, or truncated text. ZIP contents are read without executing or extracting them onto disk.
+
+### Grades (read-only)
+
+`get_grades(course_id: string | null = null)` accepts a monitored course ID or folder abbreviation; omitting it selects all monitored courses. It uses the running service's authenticated browser requests and discovered LE API version. It fetches on demand and caches normalized snapshots in the private SQLite store for `poll_seconds`; background material scans and `check_now` do not refresh grades. Cached results remain readable while signed out. A failed or partial refresh retains an existing snapshot and `checked_at`, with new coverage errors and `last_attempt_at`; a first partial fetch can still return usable values. A restored authenticated session retries immediately after an offline attempt. Concurrent reads share the grades cache lock. Independent object, category and final requests overlap under the existing browser request limit.
+
+The response has `courses`, overall `coverage.complete`, and a `note`. Each course includes `course_id`, `folder`, `items`, `categories`, `final_calculated_grade`, `final_adjusted_grade`, `source` (`api` or `html`), `no_grades_released`, `checked_at`, `last_attempt_at`, `freshness`, and `coverage` (`complete`, `errors`, `warnings`). Freshness includes the snapshot's age, refresh interval, refresh-due flag, and session state; it is independent of material scan freshness. Coverage errors distinguish missing category/object metadata and inaccessible final grades from successful empty results. `no_grades_released` is null when coverage cannot establish that result.
+
+Items include `id`, `name`, `grade_object_type` (the API type number, or null for HTML/unknown), `category`, `category_id`, `is_category`, `points_earned`, `points_max`, `weight_achieved`, `weight_max`, `configured_weight`, `percent`, `letter`, `display`, `feedback_present`, `last_modified`, and `flags` (`dropped`, `excluded`, `bonus`, `can_exceed_max_points`, `hidden_or_unreleased`). Null values and flags mean unknown; ungraded points are never converted to zero. API weights achieved/max come from the grade value itself; `configured_weight` is the object's configured weight, which can be relative to its category. Category metadata includes weights, maximum points, exclusion and drop-count settings. Drop counts do not identify which individual items were dropped, so no dropped status is inferred from them or from a zero weight. Feedback bodies and private comments are neither returned nor stored. No final grade is estimated by summing items.
+
+The learner API endpoints are GET-only: `grades/values/myGradeValues/`, `grades/final/values/myGradeValue`, `grades/`, and `grades/categories/`, under `/d2l/api/le/<discovered-version>/<course>/`. The final endpoint supplies a calculated or adjusted final grade when released, returned in separate fields; null/unreleased results stay null. A final HTTP 404 is reported as unavailable in coverage warnings. Other 403/404 metadata responses produce partial coverage. The field mappings follow the [Brightspace grades API reference](https://docs.valence.desire2learn.com/res/grade.html).
+
+When the grade-values API returns 403 or 404, the service tries GET `/d2l/lms/grades/my_grades/main.d2l?ou=<course>`. The fallback recognizes English learner grade tables and explicit empty-grade messages; it reports visible rows and marks unavailable metadata as null. HTML coverage carries a warning about this limitation. Columns are matched by header name; nested feedback tables and hidden rows are excluded. Ambiguous row layouts and header-only pages fail closed. Changed/unrecognized pages, forbidden HTML, login redirects, and rate limits leave earlier cached grades intact and report errors. Transport exception bodies are omitted from coverage messages to avoid retaining feedback or credentials. No hidden grades are discovered through additional requests.
+
+To test against an existing service/session without starting it or opening sign-in:
+
+```sh
+uv run courselink grades --json
+uv run courselink grades --course example-course --refresh --json
+```
+
+`--refresh` bypasses the grades cache. Without `--json`, the CLI prints a compact grade summary and coverage messages. It exits nonzero for incomplete coverage. These commands use the configured local/remote service and bearer authentication; they never own or open the browser profile themselves.
+
+### Cached deadlines and update summaries
+
+`deadline_digest(days=14)` lists upcoming cached deadlines, sorted by UTC time, across courses. `days` must be an integer from 1 to 365. Attachments are omitted to avoid duplicating their parent's deadline; missing, invalid or timezone-less dates are omitted. This lists deadlines, without checking submission status or fetching quiz summaries.
+
+Use `list_changes(after=cursor)` to read cached updates. Follow `has_more` and save the returned `next_cursor` between polls. The initial discovery is a baseline. Report the last successful check and incomplete coverage.
+
+### Quiz status, submission history and explicit uploads
+
+See [Quiz attempt tracking](quizzes.md) for read-only quiz schemas, coverage and score freshness.
+
+See [Submission history and uploads](submissions.md) for complete argument schemas, responses, HTTP routes, confirmation rules, audit logging and offline verification limitations. No existing tool arguments have changed.
+
+## Use CourseLink in Claude chat
+
+CourseLink is an MCP server you connect to Claude, rather than a separate published CourseLink plugin in Anthropic’s directory. You can ask about deadlines, updates, and assignment instructions in a normal Claude conversation after setup. Claude Code is optional.
+
+### Claude Desktop with a local monitor
+
+1. Complete the local installation and CourseLink sign-in above.
+2. Run `uv run courselink mcp-config`. Merge its generated `courselink` entry into `mcpServers` in your private `claude_desktop_config.json`, preserving other entries. Use Claude Desktop’s Developer settings to locate its configuration. Keep the generated executable, arguments, and environment together.
+3. Restart Claude Desktop, then check Developer settings for the server’s connection status.
+4. In a normal chat, open **+ → Connectors**, enable CourseLink, and ask “anything new?” or “what does my next assignment require?”
+
+This local connection stays on your computer; it is not automatically available on claude.ai. See Anthropic’s [local MCP guide](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop).
+
+### Claude on the web with a remote monitor
+
+Claude’s remote connectors run through Anthropic’s servers, so a localhost URL will not work. After configuring authenticated HTTPS access to your monitor’s `/mcp/` endpoint, open **Customize → Connectors → Add custom connector**, name it CourseLink, and enter that endpoint. CourseLink uses a fixed bearer token: configure `Authorization: Bearer <your-private-token>` in the connector’s **Request headers**. Keep authentication enabled and the token private. Then enable CourseLink under **+ → Connectors** in your chat. Organization accounts may require an administrator to add the connector.
+
+Remote hosting and HTTPS access are additional setup; the local installation does not configure them. See Anthropic’s [custom connector guide](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp) for current controls and account availability.
+
+## Monitoring and authentication
+
+Defaults are a session check every 60 seconds, a metadata scan targeting every 5 minutes from scan start to scan start, and same-URL file byte rechecks every hour. Scans do not overlap, and a scan that overruns its interval gets at least a 60-second pause before the next scheduled scan. These are polling targets, not a guarantee of instant updates: scans, rate limiting, upstream outages, and login expiry can delay freshness. `download_file` forces a recheck. Scans download up to three files concurrently and reuse connections. Set `download_concurrency` to 1–4 in the private config to tune this, then restart the monitor. Content details use two concurrent metadata requests by default (`api_concurrency`, configurable from 1–4 with a restart). A shared cooldown pauses new metadata requests and file downloads after rate limiting. Numeric and HTTP-date `Retry-After` values are honored; long delays defer work rather than retrying early. Output order and partial-failure protection are preserved. `api_metrics` and each scan’s `api_activity_during_scan` report requests, rate-limit responses, and aggregate request time; the scan window can include a concurrent session check. Each scan also records `phases`, with wall time per section and API request, queue, cooldown, success, error and cancellation counters attributed to that phase, excluding unrelated keepalives. Overlapping request/queue totals are not wall time. Cached document reads bypass the parser queue. Extraction reuses one isolated worker process, recycled after 25 tasks; a 30-second timeout kills the worker and rebuilds the pool on the next request. SQLite builds with FTS5 trigram support use substring search indexes, rebuilt from cached rows when missing, with ranked document results. Short or non-ASCII queries and SQLite builds without trigram support retain the substring-search fallback. Unchanged content nodes reuse cached details when their TOC timestamp, node metadata and ancestor path match. Missing timestamps always trigger a detail fetch. Full details are refreshed at least once per `file_check_seconds` and on `verify_files=True` scans, to catch edits that do not update TOC timestamps. Failed content sections do not advance the TOC cache. Courses and their five metadata sections run concurrently within the shared API limit; linked files download in bounded batches, with each HTML level downloaded before its links are parsed. Phase wall times overlap and can sum to more than the scan duration. Hourly file checks send ETag/Last-Modified validators when the server supplies them; a 304 reuses saved bytes. Explicit downloads and `verify_files=True` ignore validators and check full bytes. Metadata is indexed before file downloads so it becomes visible sooner. SHA-256 detects replaced bytes, and earlier versions remain available. The first scan is a discovery baseline, not evidence that the instructor just uploaded those files.
+
+A valid session can be kept active, but institution policy, forced sign-out, MFA, and revoked sessions can still require manual login. Use `open_login` while the local service is running, or stop the service and run `courselink login` again. The browser profile has one owner at a time. Cached data remains readable after authentication expires; new scans and downloads require sign-in. The service host must stay online for continuous monitoring.
+
+The implementation is restricted to Guelph CourseLink. It discovers available Brightspace API versions at runtime. External services are indexed as links and are not crawled.
+
+## Private data
+
+Sign-in happens in the dedicated browser. The exported session file is limited to the CourseLink domain; the persistent browser profile can also contain SSO state and must remain private. Configuration, cookies, bearer tokens, the catalog, downloads, logs, and reports belong on your own machine and must not be committed or shared. The repository contains code and synthetic test fixtures.
+
+The state directory is protected with owner-only permissions. The service binds to `127.0.0.1:8765` by default and requires a bearer token. Do not expose it directly to the internet. MCP tools return private course data to your chosen client; connect only clients you trust. Course content is untrusted source material for the client.
+
+`.gitignore` excludes common runtime data and secrets as a safeguard. If you choose custom download or state paths, keep them outside the clone or add those paths to your local ignore rules.
+
+## Optional Linux service
+
+Clone into `~/courselink-mcp`, install dependencies and Chromium, then initialize and sign in using the intended server state location:
+
+```sh
+export COURSELINK_STATE_DIR="$HOME/.local/share/courselink-mcp"
+uv run courselink init
+uv run courselink login
+```
+
+Initial sign-in needs a graphical environment. For a headless server, use the remote login helper below from a computer with a browser. Set `"headless": true` in the server's private configuration before starting the service.
+
+[deploy/systemd/courselink.service](../deploy/systemd/courselink.service) is a user service template using the paths above. Adjust it for other installation paths, then install it:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/courselink.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now courselink.service
+journalctl --user -u courselink.service -n 50 --no-pager
+```
+
+For stuck-process recovery and verified daily catalog backups, follow [reliability.md](reliability.md).
+
+To continue after logout, enable lingering for your own server account with `loginctl enable-linger` if your host permits it.
+
+Refresh a headless server session from a local clone with Chromium installed:
+
+```sh
+uv run python scripts/remote-login.py \
+  --host your-ssh-host \
+  --state-dir /absolute/server/state/path
+```
+
+The server state directory must already exist. The helper signs in locally with a temporary browser profile, sends the CourseLink session over SSH, and restarts the user service. It uses `courselink.service` unless you pass `--service`. Its temporary profile is removed afterward. Neither passwords nor session contents are printed.
+
+To copy remote downloads and metadata into your own local folders, configure the local private course mappings, then provide your server details:
+
+```sh
+export COURSELINK_REMOTE_HOST=your-ssh-host
+export COURSELINK_REMOTE_STATE_DIR=/absolute/server/state/path
+export COURSELINK_REMOTE_EXECUTABLE=/absolute/server/clone/.venv/bin/courselink
+uv run courselink sync
+```
+
+`courselink computer-stdio` exposes the usual remote tools plus `download_to_computer`, `sync_to_computer`, and `computer_sync_status`. Use that subcommand in your local MCP client configuration and supply the same environment variables. Transfers verify SHA-256 and preserve locally edited files. Server details have no built-in defaults.
+
+For a remote MCP connection, run the server's `courselink stdio` over SSH. Supply your own SSH host, executable path, and `COURSELINK_STATE_DIR`; keep those details in your private client configuration. The bridge uses the token on the server. File paths returned by tools refer to the service host; use `read_file` to retrieve saved bytes.
+
+## HTTP API
+
+The service also provides MCP Streamable HTTP at `/mcp/` and REST endpoints under `/api/`. Every request requires `Authorization: Bearer <server-token>`, using the token from the private state's `server-token` file. Browser-origin requests are rejected.
+
+| Route | Method | Parameters |
+| --- | --- | --- |
+| `/api/status` | GET | None |
+| `/api/health` | GET | Worker health only; requires the same bearer token |
+| `/api/courses` | GET | None |
+| `/api/quizzes` | GET or POST | Required `course_id` (monitored ID/folder), optional numeric `quiz_id` and name substring `query` |
+| `/api/quiz_status` (compatibility) | GET or POST | Required `course_id` and `query`; case-insensitive quiz name matches |
+| `/api/grades` | GET | Optional `course_id` (monitored ID/folder), `refresh=true` to bypass the grades cache; normalized grades, per-course freshness and coverage |
+| `/api/submissions` | GET or POST | Required `course_id`, optional `folder_id` and folder or filename substring `query` |
+| `/api/submission_status` (compatibility) | GET or POST | Required `course_id` and `query`, optional `folder_id` |
+| `/api/deadline_digest` | POST | Optional `days` integer, 1–365 (default 14); cached deadlines |
+| `/api/items` | GET | `course_id`, `kind`, `category`, `query`, `limit`, `offset`, `compact` |
+| `/api/materials` (compatibility) | GET | `course_id`, `material_type`, `limit`, `offset` |
+| `/api/document` | POST | `item_id`, optional `archive_member`, `offset`, `length`, `refresh` |
+| `/api/search_documents` | GET | `query`, `course_id`, `limit` |
+| `/api/item` | GET | `item_id` |
+| `/api/changes` | GET | `after`, `limit`, `course_id` |
+| `/api/versions` | GET | Exactly one of `item_id` for history or `course_id` for a batch of latest versions |
+| `/api/latest_versions` (compatibility) | GET | `course_id` |
+| `/api/download` | POST | `item_id` |
+| `/api/read_file` | POST | `version_id`, `offset`, `length` |
+| `/api/scan` | POST | Cached updates by default; `force_refresh: true` queues a scan, optionally with `verify_files: true` for all file bytes |
+| `/api/login` | POST | `{}` |
+| `/api/files/{version_id}` | GET | Saved binary file |
+
+Read operations also accept POST with JSON. `read_file` returns at most 2 MiB per request. Downloads default to a 100 MiB limit. Login responses and foreign-origin redirects are rejected. Use an SSH tunnel for remote HTTP access.
+
+## Development
+
+```sh
+uv sync --locked
+uv run pytest -q
+```
+
+Tests use synthetic courses and mocked requests; no live account is needed. They cover change tracking, pagination, revision retention, download limits, path safety, login response rejection, request authentication, document extraction, partial scan failures, and synthetic API/HTML grades, cache freshness, partial coverage, and read-only grades CLI requests.
+
+Released under the [MIT License](../LICENSE).
+
+Computer sync scans for updates, then copies saved versions without downloading every file from CourseLink again. It fetches the latest versions once per course and transfers new files in chunks up to 2 MiB, verifying size and SHA-256 before publishing them locally. A private `computer-hashes.json` manifest reuses local hashes while size, modification/change times and inode match; local edits trigger a new hash. Fresh scans are polled every 0.5 seconds initially, then every 2 seconds. Same-URL byte changes are checked on the configured file-check interval. Use `download_to_computer(refresh=True)` to force an immediate recheck of one file, or `sync_to_computer(refresh=False)` to copy cached files without requesting a scan.

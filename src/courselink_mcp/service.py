@@ -1,0 +1,602 @@
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+from collections import deque
+from weakref import WeakValueDictionary
+from contextlib import contextmanager, suppress
+from datetime import datetime, timezone
+from dataclasses import replace
+import hashlib
+import logging
+from pathlib import Path
+import tempfile
+import json
+import time
+from urllib.parse import unquote, urljoin, urlsplit
+
+import httpx
+
+from .browser import BrowserSession, LoginRequired, RateLimited
+from .catalog import Catalog, linked_files
+from .store import Store, now, safe_name
+from .grades import fetch_grades, grade_error, has_grade
+from .extract import EXTRACTOR_VERSION, extract_path, worker_limits
+from .submissions import Submissions
+from .quizzes import Quizzes
+
+log = logging.getLogger(__name__)
+
+
+class Service:
+    def __init__(self, config):
+        self.config = config
+        self.store = Store(config.state / 'catalog.sqlite3')
+        self.browser = BrowserSession(config)
+        self.catalog = Catalog(self.browser)
+        self.scan_lock = asyncio.Lock()
+        self.grades_lock = asyncio.Lock()
+        self.download_locks = WeakValueDictionary()
+        self.download_slots = asyncio.Semaphore(config.download_concurrency)
+        self.active_downloads = 0
+        self.download_client = None
+        self.wake = asyncio.Event()
+        self.tasks = []
+        self.ready = asyncio.Event()
+        self.extract_lock = asyncio.Lock()
+        self.extract_pool = None
+        self.heartbeats = {}
+        self.verify_files_requested = False
+        self.submissions = Submissions(self)
+        self.quizzes = Quizzes(self)
+
+    @contextmanager
+    def phase(self, report, name):
+        started = time.monotonic()
+        with self.browser.measure() as metrics:
+            try:
+                yield
+            finally:
+                phase = report['phases'].setdefault(name, {'seconds': 0, 'calls': 0, 'api': {}})
+                phase['seconds'] = round(phase['seconds'] + time.monotonic() - started, 6)
+                phase['calls'] += 1
+                for key, value in metrics.items():
+                    phase['api'][key] = round(phase['api'].get(key, 0) + value, 6)
+
+    def freshness(self):
+        latest = self.store.get_state('last_scan') or {}
+        successful = self.store.get_state('last_successful_scan') or (latest if latest.get('complete') else {})
+        checked = successful.get('finished_at')
+        age = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(checked)).total_seconds()) if checked else None
+        return {'checked_at': checked, 'age_seconds': round(age, 1) if age is not None else None,
+                'latest_scan_complete': bool(latest.get('complete')),
+                'refresh_interval_seconds': self.config.poll_seconds,
+                'refresh_due': age is None or age >= self.config.poll_seconds or not latest.get('complete'),
+                'scanning': self.scan_lock.locked(), 'session_state': self.browser.status['state']}
+
+    async def get_grades(self, course_id=None, refresh=False):
+        if type(refresh) is not bool:
+            raise ValueError('refresh must be true or false.')
+        if course_id is not None and course_id not in self.config.courses:
+            raise ValueError('Grades are available only for monitored courses.')
+        selected = [course_id] if course_id is not None else list(self.config.courses)
+        results = []
+        async with self.grades_lock:
+            for course in selected:
+                cached = self.store.grades(course) or {}
+                attempt = cached.get('last_attempt_at')
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(attempt)).total_seconds() if attempt else None
+                session_state = self.browser.status.get('state')
+                recovered = (cached.get('attempt_session_state') not in (None, 'authenticated')
+                             and session_state == 'authenticated')
+                if refresh or recovered or age is None or age >= self.config.poll_seconds:
+                    stamp = now()
+                    try:
+                        if self.browser.status.get('state') != 'authenticated':
+                            raise LoginRequired('Sign in through the existing service to refresh grades.')
+                        if not self.browser.versions.get('le'):
+                            await self.browser.discover_versions()
+                        snapshot = await fetch_grades(self.browser, course)
+                        if not snapshot['coverage']['complete'] and cached.get('checked_at'):
+                            cached = {**cached, 'coverage': snapshot['coverage'], 'last_attempt_at': stamp}
+                        else:
+                            cached = {**snapshot, 'checked_at': now(), 'last_attempt_at': stamp}
+                    except Exception as exc:
+                        # Preserve the last grade values and their original timestamp on failure.
+                        cached = {**cached, 'last_attempt_at': stamp,
+                                  'coverage': {'complete': False,
+                                      'errors': [{'section': 'grades', 'message': grade_error(exc)}],
+                                      'warnings': []}}
+                    cached['attempt_session_state'] = session_state
+                    self.store.save_grades(course, cached)
+                checked = cached.get('checked_at')
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(checked)).total_seconds() if checked else None
+                coverage = cached.get('coverage', {'complete': False, 'errors': [], 'warnings': []})
+                results.append({'course_id': course, 'folder': self.config.courses[course],
+                    'items': cached.get('items', []), 'categories': cached.get('categories', []),
+                    'final_calculated_grade': cached.get('final_calculated_grade'),
+                    'final_adjusted_grade': cached.get('final_adjusted_grade'),
+                    'source': cached.get('source'), 'checked_at': checked,
+                    'last_attempt_at': cached.get('last_attempt_at'), 'coverage': coverage,
+                    'no_grades_released': (not any(has_grade(row) for row in cached.get('items', []))
+                        and cached.get('final_calculated_grade') is None
+                        and cached.get('final_adjusted_grade') is None
+                        if checked and coverage['complete'] else None),
+                    'freshness': {'checked_at': checked, 'age_seconds': round(max(0, age), 1) if age is not None else None,
+                        'refresh_interval_seconds': self.config.poll_seconds,
+                        'refresh_due': age is None or age >= self.config.poll_seconds or not coverage['complete'],
+                        'session_state': self.browser.status['state']}})
+        return {'courses': results, 'coverage': {'complete': all(c['coverage']['complete'] for c in results)},
+                'note': 'Read-only grades, cached on demand. Null fields/flags mean unknown. '
+                        'Missing or unreleased grades are never treated as zero; no final grade is estimated.'}
+
+    async def start(self):
+        self.heartbeats = {name: time.monotonic() for name in ('session', 'scan', 'index')}
+        self.tasks = [asyncio.create_task(worker()) for worker in
+                      (self.session_loop, self.scan_loop, self.index_loop)]
+
+    async def close(self):
+        for task in self.tasks:
+            task.cancel()
+        for task in self.tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        try:
+            await self.browser.close()
+        finally:
+            try:
+                if self.download_client:
+                    await self.download_client.aclose()
+            finally:
+                self.stop_extract_pool()
+                self.store.close()
+
+    async def session_loop(self):
+        while True:
+            try:
+                if self.browser.context is None or self.browser.closed:
+                    if self.browser.playwright is not None:
+                        await asyncio.wait_for(self.browser.close(), 30)
+                    await asyncio.wait_for(self.browser.start(), 60)
+                    self.ready.set()
+                previous = self.browser.status.get('state')
+                await asyncio.wait_for(self.browser.keepalive(), 180)
+                if previous != 'authenticated' and self.browser.status['state'] == 'authenticated':
+                    self.wake.set()
+            except Exception as exc:
+                if isinstance(exc, TimeoutError):
+                    self.browser.closed = True
+                log.warning('Browser health check failed: %s', type(exc).__name__)
+                self.browser.status = {'state': 'connection_error', 'message': str(exc)[:300],
+                                       'last_verified': self.browser.status.get('last_verified')}
+            self.heartbeats['session'] = time.monotonic()
+            await asyncio.sleep(self.config.keepalive_seconds)
+
+    async def scan_loop(self):
+        await self.ready.wait()
+        while True:
+            cycle_started = time.monotonic()
+            self.wake.clear()
+            if self.browser.status.get('state') == 'authenticated':
+                try:
+                    verify_files = self.verify_files_requested
+                    self.verify_files_requested = False
+                    await asyncio.wait_for(self.scan(verify_files=verify_files), 1800)
+                except Exception as exc:
+                    log.warning('CourseLink scan failed: %s', type(exc).__name__)
+                    self.store.set_state('last_error', {'time': now(), 'message': str(exc)[:300]})
+            self.heartbeats['scan'] = time.monotonic()
+            # Aim for start-to-start polling, without hammering CourseLink after a slow scan.
+            delay = max(60, self.config.poll_seconds - (time.monotonic() - cycle_started))
+            try:
+                await asyncio.wait_for(self.wake.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
+
+    def health(self):
+        # Login expiry and upstream outages do not make the local process unhealthy.
+        # Detect dead workers and missed progress, rather than restarting for MFA.
+        limits = {'session': self.config.keepalive_seconds + 300,
+                  'scan': self.config.poll_seconds + 1860, 'index': 600}
+        current = time.monotonic()
+        stalled = [name for name, limit in limits.items()
+                   if current - self.heartbeats.get(name, 0) > limit]
+        workers_alive = len(self.tasks) == 3 and all(not task.done() for task in self.tasks)
+        return {'healthy': workers_alive and not stalled, 'workers_alive': workers_alive,
+                'stalled_workers': stalled}
+
+    def status(self):
+        return {'health': self.health(), 'session': self.browser.status, 'scanning': self.scan_lock.locked(),
+                'freshness': self.freshness(),
+                'last_scan': self.store.get_state('last_scan'), 'last_error': self.store.get_state('last_error'),
+                'poll_seconds': self.config.poll_seconds, 'file_check_seconds': self.config.file_check_seconds,
+                'downloads': {'active': self.active_downloads, 'concurrency': self.config.download_concurrency},
+                'api_metrics': {**self.browser.metrics, 'concurrency': self.config.api_concurrency},
+                'monitored_courses': self.config.courses, 'api_versions': self.browser.versions,
+                'text_index': self.store.index_status(),
+                'coverage_scope': 'Accessible content, assignments, announcements, calendar and quiz metadata '
+                    'for selected courses, plus linked files under CourseLink /content/ and /shared/. '
+                    'Hidden/locked material, external services and quiz questions are outside this scope. '
+                    'A complete scan does not guarantee every file is text-extractable; inspect text_index and document warnings.',
+                'note': 'Cached results remain readable offline. The host running this service must be online for monitoring.'}
+
+    def request_scan(self, verify_files=False):
+        if type(verify_files) is not bool:
+            raise ValueError('verify_files must be true or false.')
+        self.verify_files_requested = self.verify_files_requested or verify_files
+        self.wake.set()
+        return {'queued': True, 'verify_files': self.verify_files_requested,
+                'session': self.browser.status, 'already_scanning': self.scan_lock.locked()}
+
+    def stop_extract_pool(self):
+        pool, self.extract_pool = self.extract_pool, None
+        if pool is None:
+            return
+        if hasattr(pool, 'kill_workers'):
+            pool.kill_workers()
+        else:
+            # Python 3.11–3.13 lack the public kill_workers API. Capture workers
+            # before shutdown clears the mapping, then kill and reap hung parsers.
+            processes = list(pool._processes.values())
+            pool.shutdown(wait=False, cancel_futures=True)
+            for process in processes:
+                if process.is_alive():
+                    process.kill()
+            for process in processes:
+                process.join(timeout=1)
+
+    async def extract_document(self, version, member=None):
+        # A cached read must not queue behind an unrelated slow parser.
+        cached = self.store.document(version['id']) if member is None else None
+        if cached is not None and cached.get('extractor_version') == EXTRACTOR_VERSION:
+            return cached
+        async with self.extract_lock:
+            cached = self.store.document(version['id']) if member is None else None
+            if cached is not None and cached.get('extractor_version') == EXTRACTOR_VERSION:
+                return cached
+            if self.extract_pool is None:
+                self.extract_pool = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=25,
+                    mp_context=multiprocessing.get_context('spawn'), initializer=worker_limits)
+            try:
+                result = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(
+                    self.extract_pool, extract_path, version['path'], member), 30)
+            except asyncio.TimeoutError:
+                self.stop_extract_pool()
+                result = {'status': 'extraction_timeout', 'text': '', 'warning': 'Retrieve the original file for inspection.'}
+            except asyncio.CancelledError:
+                self.stop_extract_pool()
+                raise
+            except Exception:
+                self.stop_extract_pool()
+                result = {'status': 'extraction_error', 'text': '', 'warning': 'Document extraction exceeded limits or failed.'}
+            if member is None:
+                result['extractor_version'] = EXTRACTOR_VERSION
+                self.store.save_document(version['id'], result)
+            return result
+
+    async def index_loop(self):
+        while True:
+            delay = 5
+            try:
+                self.heartbeats['index'] = time.monotonic()
+                pending = self.store.pending_documents()
+                for version in pending:
+                    await self.extract_document(version)
+                    self.heartbeats['index'] = time.monotonic()
+                    await asyncio.sleep(0)
+                if pending:
+                    delay = 0  # Keep draining a backlog; idle polling still sleeps.
+            except Exception as exc:
+                log.warning('Text index failed: %s', type(exc).__name__)
+            await asyncio.sleep(delay)
+
+    async def scan(self, verify_files=False):
+        async with self.scan_lock:
+            started = time.monotonic()
+            initial_metrics = dict(self.browser.metrics)
+            report = {'started_at': now(), 'finished_at': None, 'courses': {}, 'errors': [], 'files_saved': 0,
+                      'phases': {}}
+            report['verify_files'] = verify_files
+            try:
+                settings_path = self.config.state / 'config.json'
+                if settings_path.exists():
+                    settings = json.loads(settings_path.read_text())
+                    selected = replace(self.config, courses=settings.get('courses', self.config.courses)).validate()
+                    self.config.courses = selected.courses
+                with self.phase(report, 'enrollment'):
+                    courses = await self.catalog.courses()
+                for course in courses:
+                    course['monitored'] = course['id'] in self.config.courses
+                    course['folder'] = self.config.courses.get(course['id'])
+                self.store.save_courses(courses)
+                enrolled = {course['id'] for course in courses}
+                tasks = []
+                for course in self.config.courses:
+                    if course not in enrolled:
+                        report['errors'].append({'course': course, 'section': 'enrollment',
+                                                 'message': 'Configured course not present in current enrollments.'})
+                    else:
+                        tasks.append(self.scan_course(course, report, verify_files))
+                await self.gather_cancel(tasks)
+            except asyncio.CancelledError:
+                report['errors'].append({'section': 'scan', 'message': 'Scan interrupted or exceeded its time limit.'})
+                raise
+            except LoginRequired:
+                self.browser.status = {'state': 'login_required', 'message': 'Please sign in again.'}
+                report['errors'].append({'section': 'session', 'message': 'Sign in again.'})
+                raise
+            except Exception as exc:
+                report['errors'].append({'section': 'scan', 'message': str(exc)[:250]})
+                raise
+            finally:
+                report['duration_seconds'] = round(time.monotonic() - started, 3)
+                report['api_activity_during_scan'] = {
+                    key: round(value - initial_metrics[key], 3) for key, value in self.browser.metrics.items()}
+                report['finished_at'] = now()
+                report['complete'] = not report['errors'] and len(report['courses']) == len(self.config.courses)
+                report['complete'] = report['complete'] and all(len(v) == 6 for v in report['courses'].values())
+                self.store.set_state('last_scan', report)
+                if report['complete']:
+                    self.store.set_state('last_successful_scan', report)
+            self.store.set_state('last_error', None)
+            return report
+
+    @staticmethod
+    async def gather_cancel(coroutines):
+        tasks = [asyncio.create_task(coro) for coro in coroutines]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    async def scan_course(self, course, report, verify_files=False):
+        counts = report['courses'][course] = {}
+        local = {'errors': [], 'files_saved': 0}
+        pending = []
+
+        async def section(kind, fetch):
+            try:
+                with self.phase(report, kind):
+                    toc_state = {}
+                    if kind == 'content':
+                        cached = self.store.get_state(f'content_toc:{course}', {})
+                        refreshed = self.store.get_state(f'content_refreshed:{course}')
+                        full = (verify_files or not refreshed or
+                            (datetime.now(timezone.utc) - datetime.fromisoformat(refreshed)).total_seconds()
+                            >= self.config.file_check_seconds)
+                        previous = {} if full else {
+                            row['id']: (cached.get(row['id']), json.loads(row['data']))
+                            for row in self.store.db.execute(
+                                'SELECT id,data FROM items WHERE course_id=? AND kind=? AND available=1',
+                                (course, 'content'))}
+                        rows = await fetch(course, previous=previous, toc_state=toc_state)
+                    else:
+                        rows = await fetch(course)
+                    self.store.reconcile(course, kind, rows)
+                    if kind == 'content':
+                        self.store.set_state(f'content_toc:{course}', toc_state)
+                        if full:
+                            self.store.set_state(f'content_refreshed:{course}', now())
+                counts[kind] = len(rows)
+                pending.extend(rows)
+            except (LoginRequired, RateLimited):
+                raise
+            except Exception as exc:
+                local['errors'].append({'course': course, 'section': kind, 'message': str(exc)[:250]})
+
+        try:
+            await self.gather_cancel(section(kind, fetch) for kind, fetch in [
+                ('content', self.catalog.content), ('assignment', self.catalog.assignments),
+                ('announcement', self.catalog.announcements), ('event', self.catalog.calendar),
+                ('quiz', self.catalog.quizzes)])
+            with self.phase(report, 'downloads'):
+                await self.download_rows(course, pending, local, verify_files=verify_files)
+            try:
+                with self.phase(report, 'linked_files'):
+                    count, saved, errors = await self.scan_linked_files(course,
+                        verify_files=verify_files, parents_complete=not local['errors'])
+                counts['linked_file'] = count
+                local['files_saved'] += saved
+                local['errors'].extend(errors)
+            except (LoginRequired, RateLimited):
+                raise
+            except Exception as exc:
+                local['errors'].append({'course': course, 'section': 'linked_file', 'message': str(exc)[:250]})
+        finally:
+            report['files_saved'] += local['files_saved']
+            report['errors'].extend(local['errors'])
+
+    async def scan_linked_files(self, course, verify_files=False, parents_complete=True):
+        rows = self.store.db.execute('SELECT id FROM items WHERE course_id=? AND available=1 AND kind!=?',
+                                     (course, 'linked_file')).fetchall()
+        queue = deque(self.store.get(row[0]) for row in rows)
+        found, visited, saved = {}, set(), 0
+        errors = [] if parents_complete else [{'course': course, 'section': 'linked_file',
+            'message': 'Parent metadata or files are incomplete; preserving previously discovered links.'}]
+        while queue:
+            children = []
+            for _ in range(len(queue)):
+                parent = queue.popleft()
+                if parent['id'] in visited:
+                    continue
+                visited.add(parent['id'])
+                if len(visited) > 2000:
+                    raise ValueError('Too many linked course pages; leaving the previous link index intact.')
+                documents = []
+                for field in ('body', 'instructions'):
+                    raw = parent.get(field)
+                    if isinstance(raw, dict) and raw.get('Html'):
+                        documents.append(raw['Html'])
+                # Link attachments can point at a file without being in the formal attachment list.
+                if parent.get('links'):
+                    from html import escape
+                    documents.append(''.join('<a href="' + escape(link.get('Href', ''), quote=True) + '">file</a>'
+                                             for link in parent['links']))
+                if (parent.get('filename') or '').lower().endswith(('.html', '.htm')):
+                    versions = self.store.versions(parent['id'])
+                    if not versions:
+                        errors.append({'course': course, 'item': parent['id'], 'section': 'linked_file',
+                                       'message': 'HTML page unavailable; link coverage is incomplete.'})
+                    else:
+                        try:
+                            documents.append(Path(versions[0]['path']).read_text(errors='replace'))
+                        except OSError as exc:
+                            errors.append({'course': course, 'item': parent['id'], 'section': 'linked_file',
+                                           'message': type(exc).__name__})
+                for document in documents:
+                    for child in linked_files(parent, document, self.browser):
+                        if child['id'] in found:
+                            continue
+                        found[child['id']] = child
+                        # Reconcile only the full set at the end; incremental upserts must not hide other links.
+                        self.store.upsert_link(child)
+                        children.append(child)
+                        queue.append(child)
+            batch = {'files_saved': 0, 'errors': []}
+            await self.download_rows(course, children, batch, verify_files=verify_files)
+            saved += batch['files_saved']
+            errors.extend({**error, 'section': 'linked_file'} for error in batch['errors'])
+        self.store.reconcile(course, 'linked_file', list(found.values()), mark_missing=not errors)
+        return len(found), saved, errors
+
+    async def download_rows(self, course, rows, report, verify_files=False):
+        pending = iter(row for row in rows if row.get('download_path')
+                       and (verify_files or self.store.needs_download(row, self.config.file_check_seconds)))
+
+        async def worker():
+            for row in pending:
+                try:
+                    result = await self.download(row['id'], verify_files=verify_files)
+                    report['files_saved'] += int(result['new_version'])
+                except (LoginRequired, RateLimited):
+                    raise
+                except Exception as exc:
+                    report['errors'].append({'course': course, 'item': row['id'], 'message': str(exc)[:250]})
+
+        tasks = [asyncio.create_task(worker()) for _ in range(self.config.download_concurrency)]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    async def download(self, item_id, verify_files=True):
+        lock = self.download_locks.setdefault(item_id, asyncio.Lock())
+        async with lock, self.download_slots:
+            self.active_downloads += 1
+            try:
+                return await self._download(item_id, verify_files=verify_files)
+            finally:
+                self.active_downloads -= 1
+
+    async def _download(self, item_id, verify_files=True):
+        row = self.store.get(item_id)
+        if not row['available'] or not row.get('download_path'):
+            raise ValueError('This item does not have a currently available downloadable file.')
+        if self.browser.status.get('state') != 'authenticated':
+            raise LoginRequired('Sign in before downloading. Cached versions remain available.')
+        course = row['course_id']
+        folder = self.config.courses.get(course)
+        if not folder:
+            raise ValueError('This course is not enabled for downloads.')
+        root = (self.config.school / folder / 'CourseLink Downloads').resolve()
+        expected = (self.config.school / folder).resolve()
+        if not root.is_relative_to(self.config.school) or not root.is_relative_to(expected):
+            raise ValueError('Download directory escapes the school folder.')
+        item_folder = root / safe_name(row['kind']) / safe_name(row['id'])
+        item_folder.mkdir(parents=True, exist_ok=True)
+        if not item_folder.resolve().is_relative_to(root):
+            raise ValueError('Unsafe download directory.')
+        filename = safe_name(unquote(row.get('filename') or row['title']))
+        url = self.browser.url(row['download_path'])
+        fallback = None
+        if row['kind'] == 'content' and row.get('source_url'):
+            try:
+                candidate = self.browser.url(row['source_url'])
+                decoded = unquote(urlsplit(candidate).path)
+                if decoded.startswith(('/content/', '/shared/')) and '\\' not in decoded and '..' not in decoded.split('/'):
+                    fallback = candidate
+            except ValueError:
+                pass
+        latest = self.store.latest_version(item_id)
+        temp = None
+        try:
+            if self.download_client is None:
+                self.download_client = httpx.AsyncClient(timeout=60, follow_redirects=False,
+                    trust_env=False, limits=httpx.Limits(max_connections=self.config.download_concurrency,
+                        max_keepalive_connections=self.config.download_concurrency))
+            client = self.download_client
+            for _ in range(6):
+                await self.browser.wait_for_cooldown()
+                cookies = await self.browser.cookies()
+                cookie_header = httpx.Request('GET', url, cookies=cookies).headers.get('cookie', '')
+                headers = {'Cookie': cookie_header}
+                conditional = (not verify_files and latest and latest.get('validator_url') == url
+                               and Path(latest['path']).is_file())
+                if conditional:
+                    if latest.get('etag'):
+                        headers['If-None-Match'] = latest['etag']
+                    if latest.get('last_modified'):
+                        headers['If-Modified-Since'] = latest['last_modified']
+                if verify_files:
+                    headers['Cache-Control'] = 'no-cache'
+                async with client.stream('GET', url, headers=headers) as response:
+                    if response.status_code == 304:
+                        if not conditional or not any(key.startswith('If-') for key in headers):
+                            raise ValueError('Unexpected not-modified response without a cached validator.')
+                        self.store.file_checked(row)
+                        return {'item_id': item_id, 'new_version': False, 'version': latest}
+                    if response.status_code == 404 and fallback and urlsplit(url).path.startswith('/d2l/api/'):
+                        url, fallback = fallback, None
+                        continue
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        redirect = urljoin(url, response.headers.get('location', ''))
+                        try:
+                            url = self.browser.url(redirect)
+                        except ValueError:
+                            raise LoginRequired('Download redirected outside CourseLink; sign in again.')
+                        if any(part in url.lower() for part in ('/login', '/auth/', '/saml')):
+                            raise LoginRequired('Download requires sign-in.')
+                        continue
+                    if response.status_code == 401:
+                        raise LoginRequired('Download requires sign-in.')
+                    if response.status_code == 429:
+                        self.browser.rate_limit(response.headers.get('retry-after', '5'))
+                        raise RateLimited('Download rate-limited; will retry on the next scan.')
+                    response.raise_for_status()
+                    size_header = response.headers.get('content-length')
+                    if size_header and int(size_header) > self.config.max_file_bytes:
+                        raise ValueError('File exceeds the configured 100 MiB limit.')
+                    digest, size, beginning = hashlib.sha256(), 0, b''
+                    with tempfile.NamedTemporaryFile(dir=item_folder, suffix='.partial', delete=False) as handle:
+                        temp = Path(handle.name)
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > self.config.max_file_bytes:
+                                raise ValueError('File exceeds the configured size limit.')
+                            if len(beginning) < 8192:
+                                beginning += chunk[:8192-len(beginning)]
+                            digest.update(chunk)
+                            handle.write(chunk)
+                    content_type = response.headers.get('content-type', '').lower()
+                    if 'text/html' in content_type and not filename.lower().endswith(('.html', '.htm')):
+                        raise LoginRequired('Received an HTML page instead of the requested file.')
+                    if b'login.microsoftonline.com' in beginning or b'name="password"' in beginning.lower():
+                        raise LoginRequired('Received a sign-in page instead of a course file.')
+                    hexdigest = digest.hexdigest()
+                    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+                    destination = item_folder / f'{stamp}-{hexdigest[:12]}-{filename}'
+                    version, changed = self.store.record_file(row, temp, destination, hexdigest, size)
+                    self.store.file_validators(version['id'], response.headers.get('etag'),
+                                               response.headers.get('last-modified'), url)
+                    version = self.store.latest_version(item_id)
+                    self.store.file_checked(row)
+                    return {'item_id': item_id, 'new_version': changed, 'version': version}
+            raise RuntimeError('Too many redirects for a CourseLink file.')
+        finally:
+            if temp and temp.exists():
+                temp.unlink()
